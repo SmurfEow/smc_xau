@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Quantum Terminal</title>
-    <link rel="stylesheet" href="styles.css?v=20260324b" />
+    <link rel="stylesheet" href="styles.css?v=20260324e" />
   </head>
   <body>
     <div class="shell">
@@ -14,6 +14,10 @@
           <h1>Multi-Timeframe Market Surface</h1>
         </div>
         <div class="topbar-meta">
+          <a class="meta-pill meta-link" href="/dashboard.html">
+            <span>Reports</span>
+            <strong>Profit Dashboard</strong>
+          </a>
           <div class="meta-pill">
             <span>Symbol</span>
             <strong id="active-symbol-label">XAUUSD</strong>
@@ -21,6 +25,10 @@
           <div class="meta-pill">
             <span>Status</span>
             <strong id="bridge-status">Connecting</strong>
+          </div>
+          <div class="meta-pill">
+            <span>Cooldown</span>
+            <strong id="cooldown-label">--:--</strong>
           </div>
           <div class="meta-pill clock-pill">
             <span>Local Time</span>
@@ -45,9 +53,99 @@
         </div>
       </section>
 
-      <main id="board" class="board"></main>
+      <section class="content-scroll">
+        <section id="autotrade-panel" class="autotrade-panel glass">
+          <div class="autotrade-panel-header">
+            <div>
+              <p class="eyebrow">Execution</p>
+              <h2>Auto Trade Control</h2>
+            </div>
+            <div class="autotrade-panel-actions">
+              <button id="autotrade-panel-toggle" class="collapse-button" type="button" aria-expanded="true">-</button>
+            </div>
+          </div>
+          <div class="autotrade-panel-body">
+            <div class="autotrade-panel-grid">
+              <div class="autotrade-status">
+                <span>Auto Trade</span>
+                <strong id="autotrade-status">Off</strong>
+              </div>
+              <div class="autotrade-status">
+                <span>Trade State</span>
+                <strong id="active-trade-state">Idle</strong>
+              </div>
+              <div class="autotrade-status">
+                <span>Ticket</span>
+                <strong id="active-trade-ticket">--</strong>
+              </div>
+              <label class="autotrade-lot-field">
+                <span>Lot</span>
+                <input id="autotrade-lot" type="number" min="0.01" step="0.01" value="0.01" />
+              </label>
+              <button id="autotrade-toggle" class="action-button primary" type="button">Enable Auto</button>
+            </div>
+            <div class="autotrade-live-card">
+              <div class="autotrade-live-header">
+                <h3>Active Trade</h3>
+                <p id="active-trade-copy">No live trade is open right now.</p>
+              </div>
+              <div class="autotrade-live-grid">
+                <div class="live-pill"><span>Symbol</span><strong id="active-trade-symbol">--</strong></div>
+                <div class="live-pill"><span>Side</span><strong id="active-trade-side">--</strong></div>
+                <div class="live-pill"><span>Volume</span><strong id="active-trade-volume">--</strong></div>
+                <div class="live-pill"><span>Open Price</span><strong id="active-trade-price">--</strong></div>
+                <div class="live-pill"><span>S/L</span><strong id="active-trade-sl">--</strong></div>
+                <div class="live-pill"><span>T/P</span><strong id="active-trade-tp">--</strong></div>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section id="trade-overview" class="trade-overview glass">
+          <div class="trade-overview-header">
+            <div>
+              <p class="eyebrow">Trade Engine</p>
+              <h2 id="overview-action">No Trade</h2>
+            </div>
+            <div class="trade-overview-controls">
+              <div class="overview-score-block">
+                <span>Confidence</span>
+                <strong id="overview-score">0</strong>
+              </div>
+              <button id="trade-overview-toggle" class="collapse-button" type="button" aria-expanded="true">-</button>
+            </div>
+          </div>
+          <div class="trade-overview-body">
+            <div class="overview-sides">
+              <section class="overview-side overview-side-long">
+                <div class="overview-side-header">
+                  <h3>Long</h3>
+                  <strong id="overview-long-score">0</strong>
+                </div>
+                <div class="overview-checks" id="overview-long-checks"></div>
+              </section>
+              <section class="overview-side overview-side-short">
+                <div class="overview-side-header">
+                  <h3>Short</h3>
+                  <strong id="overview-short-score">0</strong>
+                </div>
+                <div class="overview-checks" id="overview-short-checks"></div>
+              </section>
+            </div>
+            <section class="indicator-panel">
+              <div class="indicator-panel-header">
+                <h3>Live Indicator Thresholds</h3>
+                <p>EMA, RSI, ADX, ATR, and VWAP across the active timeframes.</p>
+              </div>
+              <div id="indicator-grid" class="indicator-grid"></div>
+            </section>
+            <p id="overview-summary" class="overview-summary">Waiting for enough timeframe data to evaluate trade readiness.</p>
+          </div>
+        </section>
+
+        <main id="board" class="board"></main>
+      </section>
     </div>
 
-    <script src="app.js?v=20260324b"></script>
+    <script src="app.js?v=20260324e"></script>
   </body>
 </html>

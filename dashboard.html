@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quantum Profit Dashboard</title>
+    <link rel="stylesheet" href="styles.css?v=20260325c" />
+  </head>
+  <body>
+    <div class="dashboard-shell">
+      <header class="topbar glass">
+        <div class="brand-block">
+          <p class="eyebrow">Quantum Terminal</p>
+          <h1>MT5 Profit Dashboard</h1>
+        </div>
+        <div class="topbar-meta">
+          <a class="meta-pill meta-link" href="/index.html">
+            <span>Workspace</span>
+            <strong>Back To Board</strong>
+          </a>
+          <div class="meta-pill">
+            <span>Status</span>
+            <strong id="dashboard-status">Loading</strong>
+          </div>
+          <div class="meta-pill">
+            <span>Timezone</span>
+            <strong id="dashboard-timezone">--</strong>
+          </div>
+          <div class="meta-pill clock-pill">
+            <span>Local Time</span>
+            <strong id="dashboard-clock">--:--:--</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="dashboard-scroll">
+        <section class="history-filters glass">
+          <div class="history-filters-row">
+            <button class="action-button history-filter is-active" type="button" data-period="daily">Daily</button>
+            <button class="action-button history-filter" type="button" data-period="weekly">Weekly</button>
+            <button class="action-button history-filter" type="button" data-period="monthly">Monthly</button>
+            <button class="action-button history-filter" type="button" data-period="yearly">Yearly</button>
+            <button class="action-button history-filter" type="button" data-period="all">Entire History</button>
+            <button class="action-button history-filter" type="button" data-period="custom">Custom Date</button>
+          </div>
+          <div class="history-filters-row history-custom-range">
+            <label class="symbol-field narrow">
+              <span>From</span>
+              <input id="history-date-from" type="date" />
+            </label>
+            <label class="symbol-field narrow">
+              <span>To</span>
+              <input id="history-date-to" type="date" />
+            </label>
+            <button id="history-apply" class="action-button primary" type="button">Apply Range</button>
+          </div>
+        </section>
+
+        <section class="dashboard-grid">
+          <article id="today-net-card" class="summary-card glass">
+            <p id="selected-period-label" class="eyebrow">Daily Net</p>
+            <h2 id="today-net-value">--</h2>
+            <p id="today-date-copy">Waiting for MT5 history...</p>
+          </article>
+          <article id="today-count-card" class="summary-card glass">
+            <p id="selected-count-label" class="eyebrow">Daily Trades</p>
+            <h2 id="today-trades-value">--</h2>
+            <p id="today-breakdown-copy">--</p>
+          </article>
+          <article id="all-net-card" class="summary-card glass">
+            <p class="eyebrow">All-Time Net</p>
+            <h2 id="all-net-value">--</h2>
+            <p id="all-breakdown-copy">--</p>
+          </article>
+          <article class="summary-card glass">
+            <p class="eyebrow">Latest Result</p>
+            <h3 id="latest-result-value">--</h3>
+            <p id="latest-result-copy">Waiting for closed deals...</p>
+          </article>
+        </section>
+
+        <section class="insights-grid">
+          <article class="analytics-card glass">
+            <div class="history-panel-header">
+              <div>
+                <p class="eyebrow">Pulse</p>
+                <h2>Outcome Snapshot</h2>
+              </div>
+              <p id="snapshot-copy">Waiting for data...</p>
+            </div>
+            <div id="snapshot-grid" class="snapshot-grid"></div>
+          </article>
+          <article class="analytics-card glass">
+            <div class="history-panel-header">
+              <div>
+                <p class="eyebrow">Flow</p>
+                <h2>Close-Time Rhythm</h2>
+              </div>
+              <p id="hourly-copy">Waiting for data...</p>
+            </div>
+            <div id="hourly-chart" class="bars-chart"></div>
+          </article>
+        </section>
+
+        <section class="analytics-grid">
+          <article class="analytics-card glass">
+            <div class="history-panel-header">
+              <div>
+                <p class="eyebrow">Visualization</p>
+                <h2>Cumulative Net Curve</h2>
+              </div>
+              <p id="equity-curve-copy">Waiting for data...</p>
+            </div>
+            <div id="equity-curve-chart" class="curve-chart"></div>
+          </article>
+          <article class="analytics-card glass">
+            <div class="history-panel-header">
+              <div>
+                <p class="eyebrow">Performance Lenses</p>
+                <h2>What To Change</h2>
+              </div>
+              <p id="type-stats-copy">Waiting for data...</p>
+            </div>
+            <div id="type-stats-chart" class="type-stats-chart"></div>
+          </article>
+        </section>
+
+        <section class="history-panel glass">
+          <div class="history-panel-header">
+            <div>
+              <p class="eyebrow">History</p>
+              <h2>Closed MT5 Deals</h2>
+            </div>
+            <p id="history-count-copy">Loading history...</p>
+          </div>
+          <div class="history-table-wrap">
+            <table class="history-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Ticket</th>
+                  <th>Type</th>
+                  <th>Volume</th>
+                  <th>Price</th>
+                  <th>S / L</th>
+                  <th>T / P</th>
+                  <th>Time</th>
+                  <th>Price</th>
+                  <th>Profit</th>
+                  <th>Change</th>
+                </tr>
+              </thead>
+              <tbody id="history-table-body">
+                <tr>
+                  <td colspan="12">Loading MT5 history...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </div>
+
+    <script src="dashboard.js?v=20260325c"></script>
+  </body>
+</html>
