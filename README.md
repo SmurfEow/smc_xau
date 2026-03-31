@@ -232,6 +232,123 @@ The dashboard uses 3 main sessions:
 - `London`
 - `New York`
 
+## Google Sheets Sync
+
+Quantum includes a lightweight Google Sheets exporter for a single journal-style performance sheet.
+
+### Files
+
+- `google_sheet_sync.py`
+  Builds daily and summary rows from local MT5 closed history
+- `google_sheets_webhook.gs`
+  Optional Google Apps Script receiver
+
+### Journal structure
+
+One sheet tab contains rows for:
+
+- `YEAR`
+- `MONTH`
+- `WEEK`
+- `DAY`
+
+Suggested columns:
+
+- `level`
+- `period`
+- `pnl`
+- `trades`
+- `wins`
+- `losses`
+- `win_pct`
+- `log_time_local`
+- `symbol`
+- `magic`
+
+### Local usage
+
+Print rows locally:
+
+```powershell
+python google_sheet_sync.py
+```
+
+Print JSON:
+
+```powershell
+python google_sheet_sync.py --json
+```
+
+Sync one broker date only:
+
+```powershell
+python google_sheet_sync.py --date 2026-03-31
+```
+
+### Push to Google Sheets directly from Python
+
+Set:
+
+```powershell
+$env:GOOGLE_SERVICE_ACCOUNT_JSON='C:\path\to\service-account.json'
+$env:GOOGLE_SHEET_ID='your-google-sheet-id'
+$env:GOOGLE_SHEET_TAB='profit_calendar'
+```
+
+Your Google Sheet must be shared with the service account email as `Editor`.
+
+Then push:
+
+```powershell
+python google_sheet_sync.py --push
+```
+
+### Optional Apps Script webhook path
+
+1. Open your spreadsheet and create a bound Apps Script project.
+2. Paste in `google_sheets_webhook.gs`.
+3. Set:
+   - `JOURNAL_SHEET_NAME`
+   - optional `EXPECTED_SECRET`
+4. Deploy the Apps Script as a web app that accepts `POST`.
+5. Set environment variables locally:
+
+```powershell
+$env:GOOGLE_SHEETS_WEBHOOK_URL='https://script.google.com/macros/s/.../exec'
+$env:GOOGLE_SHEETS_WEBHOOK_SECRET='your-secret-if-used'
+```
+
+6. Push rows:
+
+```powershell
+python google_sheet_sync.py --push
+```
+
+You can push:
+
+- the full journal with `--mode all`
+- daily rows only with `--mode daily`
+- summary rows only with `--mode summary`
+
+### Automatic sync on trade close
+
+If either direct Sheets credentials or the webhook is set in the server environment, Quantum can also push updates automatically when a new `Quantum Auto` trade closes.
+
+Example:
+
+```powershell
+$env:GOOGLE_SERVICE_ACCOUNT_JSON='C:\path\to\service-account.json'
+$env:GOOGLE_SHEET_ID='1XDNo6mnh7IAxE7mLpuGpF8jAr-sZ43gL0jiB2c6meIo'
+$env:GOOGLE_SHEET_TAB='profit_calendar'
+python server.py
+```
+
+When a new auto trade closes, the server will:
+
+- detect the position lifecycle change
+- find the newest closed `Quantum Auto` ticket
+- upsert the relevant `YEAR / MONTH / WEEK / DAY` rows in the journal sheet
+
 ## API Endpoints
 
 Useful local endpoints include:

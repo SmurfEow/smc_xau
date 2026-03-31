@@ -47,6 +47,7 @@ AUTOTRADE_STATE = {
     "trade_active": False,
     "trade_seen_open": False,
     "active_trade": None,
+    "last_sheet_sync_ticket": 0,
 }
 AUTOTRADE_LOCK = threading.Lock()
 MT5_LOCK = threading.Lock()
@@ -1213,9 +1214,9 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
         location_note = "Price is in the middle of structure"
 
     if ltf_tone == "bullish":
-        why.append("M5/M1 timing is turning up")
+        why.append("M5/M1 is stabilizing after the pullback")
     elif ltf_tone == "bearish":
-        why.append("M5/M1 timing is turning down")
+        why.append("M5/M1 is leaning lower short term")
     else:
         conflicts.append("M5/M1 timing is mixed")
 
@@ -1373,6 +1374,13 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
             conflicts.append("Price has moved away from the buy zone")
         if not buy_confirmation_ok:
             conflicts.append("M5/M1 confirmation candle is missing")
+        wait_why = list(why)
+        if ltf_tone == "bullish" and not buy_confirmation_ok:
+            wait_why = [
+                "H1/H4 still lean bullish",
+                "M5/M1 is stabilizing but not confirmed yet",
+                "Price is near support / pullback value",
+            ]
         return build_trade_payload(
             board=board,
             side="none",
@@ -1382,7 +1390,7 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
             location=location,
             zone_text=pullback_buy_zone,
             reason="Bullish context is clear, but none of the pullback, breakout-hold, failed-breakdown, or range-buy patterns are active yet.",
-            why=why,
+            why=wait_why,
             conflicts=conflicts,
             trigger_text="Waiting for M5/M1 bullish confirmation.",
             execution_plan="Wait for a pullback hold, breakout hold, or failed breakdown reclaim before buying.",
@@ -1404,6 +1412,13 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
             conflicts.append("Price has moved away from the sell zone")
         if not sell_confirmation_ok:
             conflicts.append("M5/M1 confirmation candle is missing")
+        wait_why = list(why)
+        if ltf_tone == "bearish" and not sell_confirmation_ok:
+            wait_why = [
+                "H1/H4 still lean bearish",
+                "M5/M1 is softening but not confirmed yet",
+                "Price is near resistance / rally value",
+            ]
         return build_trade_payload(
             board=board,
             side="none",
@@ -1413,7 +1428,7 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
             location=location,
             zone_text=rally_sell_zone,
             reason="Bearish context is clear, but none of the rally-sell, breakdown-hold, failed-breakout, or range-sell patterns are active yet.",
-            why=why,
+            why=wait_why,
             conflicts=conflicts,
             trigger_text="Waiting for M5/M1 bearish confirmation.",
             execution_plan="Wait for a rally rejection, breakdown hold, or failed breakout before selling.",
@@ -2221,7 +2236,86 @@ def get_cooldown_remaining_seconds() -> int:
     return max(0, int(remaining))
 
 
+def maybe_sync_google_sheet_after_close() -> None:
+    try:
+        from google_sheet_sync import WEBHOOK_URL, aggregate_rows, push_to_webhook
+    except Exception:
+        return
+
+    if not WEBHOOK_URL:
+        return
+
+    try:
+        history = fetch_closed_deals_history(period="all")
+    except Exception as error:
+        append_ai_logic_audit(
+            build_ai_logic_event(
+                "google_sheet_sync",
+                "error",
+                str(AUTONOMOUS_AI_STATE.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL),
+                detail=f"Could not load closed history for sheet sync: {error}",
+                model=CURRENT_STRATEGY_MODEL,
+            )
+        )
+        return
+
+    deals = history.get("deals", [])
+    latest_quantum_close = None
+    for deal in deals:
+        if str(deal.get("trade_source", "") or "") != AUTOTRADE_COMMENT:
+            continue
+        latest_quantum_close = deal
+        break
+
+    if not latest_quantum_close:
+        return
+
+    latest_ticket = int(latest_quantum_close.get("ticket", 0) or 0)
+    if latest_ticket <= 0:
+        return
+
+    with AUTOTRADE_LOCK:
+        if int(AUTOTRADE_STATE.get("last_sheet_sync_ticket", 0) or 0) == latest_ticket:
+            return
+
+    try:
+        daily_rows, summary_rows = aggregate_rows(deals)
+        close_label = str(latest_quantum_close.get("close_time_label", "") or "").strip()
+        broker_date = ""
+        if close_label:
+            close_dt = datetime.strptime(close_label, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            broker_date = close_dt.astimezone(timezone(DASHBOARD_TIME_OFFSET)).strftime("%Y-%m-%d")
+        if broker_date:
+            daily_rows = [row for row in daily_rows if row.date_broker == broker_date]
+            summary_rows = [row for row in summary_rows if row.level != "DAY" or row.period == broker_date]
+        push_to_webhook(daily_rows, summary_rows, "all")
+        with AUTOTRADE_LOCK:
+            AUTOTRADE_STATE["last_sheet_sync_ticket"] = latest_ticket
+        append_ai_logic_audit(
+            build_ai_logic_event(
+                "google_sheet_sync",
+                "success",
+                str(latest_quantum_close.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL),
+                detail=f"Synced Google Sheets after closed ticket {latest_ticket}.",
+                model=CURRENT_STRATEGY_MODEL,
+                ticket=latest_ticket,
+            )
+        )
+    except Exception as error:
+        append_ai_logic_audit(
+            build_ai_logic_event(
+                "google_sheet_sync",
+                "error",
+                str(latest_quantum_close.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL),
+                detail=f"Google Sheets sync failed for ticket {latest_ticket}: {error}",
+                model=CURRENT_STRATEGY_MODEL,
+                ticket=latest_ticket,
+            )
+        )
+
+
 def sync_autotrade_lifecycle() -> None:
+    should_sync_sheet = False
     with MT5_LOCK:
         if not mt5.initialize():
             raise RuntimeError("Could not connect to MetaTrader 5. Make sure MT5 is open and logged in.")
@@ -2262,10 +2356,13 @@ def sync_autotrade_lifecycle() -> None:
             if was_active and not active and seen_open:
                 AUTOTRADE_STATE["last_trade_at"] = time.time()
                 AUTOTRADE_STATE["trade_seen_open"] = False
+                should_sync_sheet = True
             AUTOTRADE_STATE["trade_active"] = active
             AUTOTRADE_STATE["active_trade"] = active_trade
         finally:
             mt5.shutdown()
+    if should_sync_sheet:
+        maybe_sync_google_sheet_after_close()
 
 
 def fetch_closed_deals_history(period: str = "daily", date_from: str | None = None, date_to: str | None = None) -> dict[str, object]:
