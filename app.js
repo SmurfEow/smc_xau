@@ -8,7 +8,7 @@ const MARKET_STATE_WINDOWS = {
   level: 120,
 };
 const DISPLAY_TIME_OFFSET_MS = -(8 * 60 * 60 * 1000);
-const TRADE_SCORE_THRESHOLD = 55;
+const TRADE_SCORE_THRESHOLD = 58;
 const TRADE_SCORE_EDGE = 5;
 const TIMEFRAME_GROUPS = [
   {
@@ -42,16 +42,6 @@ const bridgeStatus = document.getElementById("bridge-status");
 const cooldownLabel = document.getElementById("cooldown-label");
 const autotradePanelElement = document.getElementById("autotrade-panel");
 const autotradePanelToggle = document.getElementById("autotrade-panel-toggle");
-const overviewAction = document.getElementById("overview-action");
-const overviewScore = document.getElementById("overview-score");
-const overviewLongScore = document.getElementById("overview-long-score");
-const overviewShortScore = document.getElementById("overview-short-score");
-const overviewLongChecks = document.getElementById("overview-long-checks");
-const overviewShortChecks = document.getElementById("overview-short-checks");
-const overviewSummary = document.getElementById("overview-summary");
-const tradeOverviewElement = document.getElementById("trade-overview");
-const tradeOverviewToggle = document.getElementById("trade-overview-toggle");
-const indicatorGrid = document.getElementById("indicator-grid");
 const autotradeStatusLabel = document.getElementById("autotrade-status");
 const autotradeLotInput = document.getElementById("autotrade-lot");
 const autotradeToggleButton = document.getElementById("autotrade-toggle");
@@ -64,6 +54,13 @@ const activeTradeVolume = document.getElementById("active-trade-volume");
 const activeTradePrice = document.getElementById("active-trade-price");
 const activeTradeSl = document.getElementById("active-trade-sl");
 const activeTradeTp = document.getElementById("active-trade-tp");
+const aiBriefPanelElement = document.getElementById("ai-brief-panel");
+const aiBriefToggle = document.getElementById("ai-brief-toggle");
+const aiStatusLabel = document.getElementById("ai-status-label");
+const aiBriefMeta = document.getElementById("ai-brief-meta");
+const aiBriefContent = document.getElementById("ai-brief-content");
+const refreshAiBriefButton = document.getElementById("refresh-ai-brief");
+const contentScrollElement = document.querySelector(".content-scroll");
 
 const chartState = {};
 const domRefs = {};
@@ -79,15 +76,19 @@ for (const timeframe of TIMEFRAMES) {
     levels: { support: null, resistance: null },
     marketState: null,
     indicators: null,
+    volatility: null,
   };
 }
 
 let autoRefreshEnabled = true;
 let autoRefreshHandle = null;
 const LIVE_SYNC_MS = 1000;
-const TICK_SYNC_MS = 250;
+const TICK_SYNC_MS = 500;
+const SNAPSHOT_SYNC_MS = 60 * 1000;
 let tickRefreshHandle = null;
+let snapshotRefreshHandle = null;
 let cooldownTickHandle = null;
+let aiBriefAutoRefreshHandle = null;
 let latestTradeOverview = null;
 let autoTradeConfig = {
   enabled: false,
@@ -96,6 +97,143 @@ let autoTradeConfig = {
 let cooldownRemainingSeconds = 0;
 let tradeActive = false;
 let activeTradeSnapshot = null;
+let aiBriefState = {
+  available: false,
+  inFlight: false,
+  lastHash: "",
+  hasAutoLoaded: false,
+  review: null,
+  lastTradeSignalId: "",
+  lastExecutionSignalId: "",
+  lastAutoRefreshBoundary: "",
+};
+const WORKSPACE_SESSION_KEY = "quantum.workspaceSession";
+const WORKSPACE_SESSION_MAX_CANDLES = 320;
+const WORKSPACE_SESSION_MAX_AGE_MS = 10 * 60 * 1000;
+let lastTickSnapshot = null;
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function readWorkspaceSession() {
+  try {
+    const raw = window.sessionStorage.getItem(WORKSPACE_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeWorkspaceSession(payload) {
+  try {
+    window.sessionStorage.setItem(WORKSPACE_SESSION_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage quota or session storage access errors.
+  }
+}
+
+function buildWorkspaceSessionSnapshot() {
+  const timeframes = {};
+  for (const timeframe of TIMEFRAMES) {
+    const state = chartState[timeframe];
+    const refs = domRefs[timeframe];
+    timeframes[timeframe] = {
+      candles: Array.isArray(state?.candles) ? state.candles.slice(-WORKSPACE_SESSION_MAX_CANDLES) : [],
+      summary: state?.summary || null,
+      visibleCount: Number(state?.visibleCount || 90),
+      offset: Number(state?.offset || 0),
+      collapsed: Boolean(refs?.card?.classList.contains("is-collapsed")),
+    };
+  }
+  return {
+    saved_at: Date.now(),
+    symbol: String(activeSymbolLabel.textContent || symbolInput?.value || "XAUUSD").trim().toUpperCase(),
+    limit: String(limitInput?.value || "ALL").trim().toUpperCase() || "ALL",
+    autoRefreshEnabled: Boolean(autoRefreshEnabled),
+    autotradeCollapsed: Boolean(autotradePanelElement?.classList.contains("is-collapsed")),
+    aiCollapsed: Boolean(aiBriefPanelElement?.classList.contains("is-collapsed")),
+    aiReview: aiBriefState.review || null,
+    aiMeta: String(aiBriefMeta?.textContent || "").trim(),
+    lastTickSnapshot,
+    scrollTop: Number(contentScrollElement?.scrollTop || 0),
+    timeframes,
+  };
+}
+
+function saveWorkspaceSessionState() {
+  writeWorkspaceSession(buildWorkspaceSessionSnapshot());
+}
+
+function restoreWorkspaceSessionState() {
+  const snapshot = readWorkspaceSession();
+  if (!snapshot) return false;
+  const savedAt = Number(snapshot.saved_at || 0);
+  if (!savedAt || (Date.now() - savedAt) > WORKSPACE_SESSION_MAX_AGE_MS) return false;
+
+  if (symbolInput && snapshot.symbol) symbolInput.value = String(snapshot.symbol);
+  if (limitInput && snapshot.limit) limitInput.value = String(snapshot.limit);
+  if (activeSymbolLabel && snapshot.symbol) activeSymbolLabel.textContent = String(snapshot.symbol);
+  if (bridgeStatus) bridgeStatus.textContent = "Live";
+  autoRefreshEnabled = snapshot.autoRefreshEnabled !== false;
+  if (toggleMotionButton) {
+    toggleMotionButton.textContent = autoRefreshEnabled ? "Pause Live Sync" : "Resume Live Sync";
+  }
+
+  lastTickSnapshot = snapshot.lastTickSnapshot || null;
+
+  const timeframeData = snapshot.timeframes && typeof snapshot.timeframes === "object" ? snapshot.timeframes : {};
+  let restoredAny = false;
+  for (const timeframe of TIMEFRAMES) {
+    const cached = timeframeData[timeframe];
+    const state = chartState[timeframe];
+    const refs = domRefs[timeframe];
+    if (!cached || !state) continue;
+    state.candles = Array.isArray(cached.candles) ? cached.candles : [];
+    state.summary = cached.summary || null;
+    state.visibleCount = Math.max(20, Math.min(240, Number(cached.visibleCount || state.visibleCount || 90)));
+    state.offset = Math.max(0, Number(cached.offset || 0));
+    state.hoverIndex = null;
+    if (state.candles.length) {
+      refreshDerivedState(state);
+      state.offset = Math.min(state.offset, getMaxOffset(state));
+      restoredAny = true;
+    }
+    if (refs && typeof cached.collapsed === "boolean") {
+      setCollapsedState(refs.card, cached.collapsed, refs.collapseButton);
+    }
+  }
+
+  setCollapsedState(autotradePanelElement, false, autotradePanelToggle);
+  setCollapsedState(aiBriefPanelElement, false, aiBriefToggle);
+
+  if (snapshot.aiReview && typeof snapshot.aiReview === "object") {
+    aiBriefState.review = snapshot.aiReview;
+    const decision = String(snapshot.aiReview.decision || "no_trade").toUpperCase();
+    setAiBriefText(
+      renderTradePlanHtml(snapshot.aiReview),
+      String(snapshot.aiMeta || "").trim() || `Decision: ${decision}`,
+      true
+    );
+  }
+
+  renderBoard();
+  renderCooldownLabel();
+  renderActiveTradePanel();
+  if (contentScrollElement && Number.isFinite(Number(snapshot.scrollTop))) {
+    window.requestAnimationFrame(() => {
+      contentScrollElement.scrollTop = Number(snapshot.scrollTop || 0);
+    });
+  }
+  return restoredAny;
+}
 
 function buildBoard() {
   boardElement.innerHTML = "";
@@ -201,6 +339,13 @@ function formatCooldown(seconds) {
   const minutes = Math.floor(total / 60);
   const remainder = total % 60;
   return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function getSessionLabel(date = new Date()) {
+  const hour = date.getHours();
+  if (hour >= 0 && hour < 8) return "Asia";
+  if (hour >= 8 && hour < 16) return "London";
+  return "New York";
 }
 
 function renderCooldownLabel() {
@@ -546,6 +691,45 @@ function chooseDirectionalAnchor(entry, candidates, side, minGap = 0, maxGap = I
   );
 }
 
+function chooseTakeProfit(entry, fullTarget, side, riskSeed, minRewardGap) {
+  if (!Number.isFinite(entry) || !Number.isFinite(fullTarget)) {
+    return { value: null, mode: "missing" };
+  }
+  const direction = side === "long" ? 1 : -1;
+  const fullDistance = Math.abs(fullTarget - entry);
+  const minimumDistance = Math.max(
+    Number.isFinite(minRewardGap) ? minRewardGap : 0,
+    5
+  );
+  const maximumDistance = 15;
+  if (fullDistance < minimumDistance) {
+    return { value: null, mode: "insufficient" };
+  }
+
+  const scaledDistance = Math.min(
+    Math.max(fullDistance * 0.7, minimumDistance),
+    maximumDistance,
+    fullDistance
+  );
+  const scaledTarget = entry + direction * scaledDistance;
+  if (Math.abs(scaledTarget - entry) >= minimumDistance) {
+    if (scaledDistance < fullDistance) {
+      return { value: scaledTarget, mode: "scaled" };
+    }
+    return { value: scaledTarget, mode: "full" };
+  }
+
+  const flooredTarget = entry + direction * minimumDistance;
+  if (
+    (side === "long" && flooredTarget <= fullTarget) ||
+    (side === "short" && flooredTarget >= fullTarget)
+  ) {
+    return { value: flooredTarget, mode: "floored" };
+  }
+
+  return { value: fullTarget, mode: "full" };
+}
+
 function calculateMarketState(candles) {
   if (!candles.length) {
     return { regime: "--", trend: "--", rangePosition: "--" };
@@ -633,39 +817,6 @@ function calculateMarketState(candles) {
   return { regime, trend, rangePosition };
 }
 
-function calculateEMA(candles, period) {
-  if (!candles.length) return null;
-  const k = 2 / (period + 1);
-  let ema = Number(candles[0].close);
-  for (let index = 1; index < candles.length; index += 1) {
-    ema = Number(candles[index].close) * k + ema * (1 - k);
-  }
-  return ema;
-}
-
-function calculateRSI(candles, period = 14) {
-  if (candles.length <= period) return null;
-  let gains = 0;
-  let losses = 0;
-  for (let index = 1; index <= period; index += 1) {
-    const change = Number(candles[index].close) - Number(candles[index - 1].close);
-    if (change >= 0) gains += change;
-    else losses += Math.abs(change);
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  for (let index = period + 1; index < candles.length; index += 1) {
-    const change = Number(candles[index].close) - Number(candles[index - 1].close);
-    const gain = change > 0 ? change : 0;
-    const loss = change < 0 ? Math.abs(change) : 0;
-    avgGain = ((avgGain * (period - 1)) + gain) / period;
-    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
-  }
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
-
 function calculateATR(candles, period = 14) {
   if (candles.length <= period) return null;
   const trueRanges = [];
@@ -685,123 +836,6 @@ function calculateATR(candles, period = 14) {
     atr = ((atr * (period - 1)) + trueRanges[index]) / period;
   }
   return atr;
-}
-
-function calculateADX(candles, period = 14) {
-  if (candles.length <= period * 2) return null;
-  const trs = [];
-  const plusDMs = [];
-  const minusDMs = [];
-  for (let index = 1; index < candles.length; index += 1) {
-    const current = candles[index];
-    const previous = candles[index - 1];
-    const upMove = Number(current.high) - Number(previous.high);
-    const downMove = Number(previous.low) - Number(current.low);
-    plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
-    minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
-    trs.push(Math.max(
-      Number(current.high) - Number(current.low),
-      Math.abs(Number(current.high) - Number(previous.close)),
-      Math.abs(Number(current.low) - Number(previous.close))
-    ));
-  }
-
-  let smoothedTR = trs.slice(0, period).reduce((sum, value) => sum + value, 0);
-  let smoothedPlusDM = plusDMs.slice(0, period).reduce((sum, value) => sum + value, 0);
-  let smoothedMinusDM = minusDMs.slice(0, period).reduce((sum, value) => sum + value, 0);
-  const dxValues = [];
-
-  for (let index = period; index < trs.length; index += 1) {
-    smoothedTR = smoothedTR - (smoothedTR / period) + trs[index];
-    smoothedPlusDM = smoothedPlusDM - (smoothedPlusDM / period) + plusDMs[index];
-    smoothedMinusDM = smoothedMinusDM - (smoothedMinusDM / period) + minusDMs[index];
-    if (smoothedTR === 0) continue;
-    const plusDI = (smoothedPlusDM / smoothedTR) * 100;
-    const minusDI = (smoothedMinusDM / smoothedTR) * 100;
-    const denominator = plusDI + minusDI;
-    if (denominator === 0) continue;
-    dxValues.push((Math.abs(plusDI - minusDI) / denominator) * 100);
-  }
-
-  if (dxValues.length < period) return null;
-  let adx = dxValues.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
-  for (let index = period; index < dxValues.length; index += 1) {
-    adx = ((adx * (period - 1)) + dxValues[index]) / period;
-  }
-  return adx;
-}
-
-function calculateVWAP(candles) {
-  if (!candles.length) return null;
-  const latest = candles[candles.length - 1];
-  const latestDate = getDisplayDate(latest.time);
-  let cumulativePV = 0;
-  let cumulativeVolume = 0;
-  for (const candle of candles) {
-    const candleDate = getDisplayDate(candle.time);
-    const sameDay =
-      candleDate.getFullYear() === latestDate.getFullYear() &&
-      candleDate.getMonth() === latestDate.getMonth() &&
-      candleDate.getDate() === latestDate.getDate();
-    if (!sameDay) continue;
-    const typicalPrice = (Number(candle.high) + Number(candle.low) + Number(candle.close)) / 3;
-    const volume = Number(candle.tick_volume ?? 0) || 1;
-    cumulativePV += typicalPrice * volume;
-    cumulativeVolume += volume;
-  }
-  if (cumulativeVolume === 0) return null;
-  return cumulativePV / cumulativeVolume;
-}
-
-function calculateIndicators(candles) {
-  if (!candles.length) return null;
-  const source = candles.slice(-Math.min(300, candles.length));
-  const ema9 = calculateEMA(source, 9);
-  const ema20 = calculateEMA(source, 20);
-  const ema50 = calculateEMA(source, 50);
-  const rsi14 = calculateRSI(source, 14);
-  const atr14 = calculateATR(source, 14);
-  const adx14 = calculateADX(source, 14);
-  const vwap = calculateVWAP(source);
-  const latestClose = Number(source[source.length - 1].close);
-
-  let emaState = "Mixed";
-  if (Number.isFinite(ema9) && Number.isFinite(ema20) && Number.isFinite(ema50)) {
-    if (ema9 > ema20 && ema20 > ema50) emaState = "Bull Stack";
-    else if (ema9 < ema20 && ema20 < ema50) emaState = "Bear Stack";
-  }
-
-  let rsiState = "Neutral";
-  if (Number.isFinite(rsi14)) {
-    if (rsi14 >= 55) rsiState = "Bullish";
-    else if (rsi14 <= 45) rsiState = "Bearish";
-  }
-
-  let adxState = "Weak";
-  if (Number.isFinite(adx14)) {
-    if (adx14 >= 25) adxState = "Strong";
-    else if (adx14 >= 20) adxState = "Building";
-  }
-
-  let vwapState = "Neutral";
-  if (Number.isFinite(vwap)) {
-    vwapState = latestClose >= vwap ? "Above" : "Below";
-  }
-
-  return {
-    ema9,
-    ema20,
-    ema50,
-    emaState,
-    rsi14,
-    rsiState,
-    atr14,
-    adx14,
-    adxState,
-    vwap,
-    vwapState,
-    latestClose,
-  };
 }
 
 function detectTrigger(timeframeState) {
@@ -855,9 +889,11 @@ function buildMtfSetup(side, m30State, m15State) {
   const m15NearResistance = isNearLevel(m15Price, m15State?.levels?.support, m15State?.levels?.resistance, "short");
 
   if (side === "long") {
-    const locationPass = m30MarketState.rangePosition === "Lower" || m30MarketState.rangePosition === "Middle";
-    const zonePass = m30NearSupport || m15NearSupport;
-    const structurePass = !(m15MarketState.trend === "Bearish" && m15MarketState.regime === "Downtrend");
+    const locationPass = m30MarketState.rangePosition === "Lower";
+    const zonePass = m30NearSupport && m15NearSupport;
+    const structurePass =
+      (m15MarketState.trend === "Bullish" || m15MarketState.regime === "Transition") &&
+      m15MarketState.regime !== "Downtrend";
     const passed = locationPass && zonePass && structurePass;
     return {
       passed,
@@ -866,9 +902,11 @@ function buildMtfSetup(side, m30State, m15State) {
     };
   }
 
-  const locationPass = m30MarketState.rangePosition === "Upper" || m30MarketState.rangePosition === "Middle";
-  const zonePass = m30NearResistance || m15NearResistance;
-  const structurePass = !(m15MarketState.trend === "Bullish" && m15MarketState.regime === "Uptrend");
+  const locationPass = m30MarketState.rangePosition === "Upper";
+  const zonePass = m30NearResistance && m15NearResistance;
+  const structurePass =
+    (m15MarketState.trend === "Bearish" || m15MarketState.regime === "Transition") &&
+    m15MarketState.regime !== "Uptrend";
   const passed = locationPass && zonePass && structurePass;
   return {
     passed,
@@ -927,7 +965,11 @@ function detectLtfEntry(side, m5State, m1State) {
       m5EmaState === "Bull Stack" &&
       Number.isFinite(m5Rsi) &&
       m5Rsi >= 50;
-    const passed = closeBackAboveSupport || bullishImpulse || localBreak || momentumContinuation || rsiPush;
+    const strongTrigger = closeBackAboveSupport || localBreak;
+    const confirmationCount = [bullishImpulse, momentumContinuation, rsiPush, m1HigherLow].filter(Boolean).length;
+    const passed = strongTrigger
+      ? confirmationCount >= 1
+      : confirmationCount >= 2 && bullishImpulse;
     const triggerLabel = closeBackAboveSupport
       ? "M5 close back above support"
       : bullishImpulse
@@ -966,7 +1008,11 @@ function detectLtfEntry(side, m5State, m1State) {
     m5EmaState === "Bear Stack" &&
     Number.isFinite(m5Rsi) &&
     m5Rsi <= 50;
-  const passed = closeBackBelowResistance || bearishImpulse || localBreak || momentumContinuation || rsiPush;
+  const strongTrigger = closeBackBelowResistance || localBreak;
+  const confirmationCount = [bearishImpulse, momentumContinuation, rsiPush, m1LowerHigh].filter(Boolean).length;
+  const passed = strongTrigger
+    ? confirmationCount >= 1
+    : confirmationCount >= 2 && bearishImpulse;
   const triggerLabel = closeBackBelowResistance
     ? "M5 close back below resistance"
     : bearishImpulse
@@ -992,7 +1038,7 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
   const m30State = chartBundle.M30;
   const entry = Number(m5State?.candles?.[m5State.candles.length - 1]?.close);
   const atr = Number(m5State?.indicators?.atr14);
-  const buffer = Number.isFinite(atr) ? atr * 0.2 : 0;
+  const buffer = Number.isFinite(atr) ? atr * 0.4 : 0;
   if (!Number.isFinite(entry)) {
     return {
       entry: null,
@@ -1048,9 +1094,9 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
   const recentM5 = (m5State?.candles || []).slice(-6);
   const recentSwingLow = recentM5.length ? Math.min(...recentM5.map((candle) => Number(candle.low))) : null;
   const recentSwingHigh = recentM5.length ? Math.max(...recentM5.map((candle) => Number(candle.high))) : null;
-  const minStopDistance = Number.isFinite(atr) ? Math.max(atr * 0.75, 6) : 6;
-  const maxStopDistance = Number.isFinite(atr) ? Math.max(atr * 1.8, 18) : 18;
-  const minStructureGap = Number.isFinite(atr) ? Math.max(atr * 0.3, 2.5) : 2.5;
+  const minStopDistance = Number.isFinite(atr) ? Math.max(atr * 1.1, 8) : 8;
+  const maxStopDistance = Number.isFinite(atr) ? Math.max(atr * 2.4, 24) : 24;
+  const minStructureGap = Number.isFinite(atr) ? Math.max(atr * 0.45, 4) : 4;
   const m5SellSideLiquidity = getLiquidityPools(m5State?.candles || [], "low", 24);
   const m5BuySideLiquidity = getLiquidityPools(m5State?.candles || [], "high", 24);
   const m15SellSideLiquidity = getLiquidityPools(m15State?.candles || [], "low", 80);
@@ -1060,12 +1106,22 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
   const m30SwingLows = getSwingCandidates(m30State?.candles || [], "low", 120);
   const m30SwingHighs = getSwingCandidates(m30State?.candles || [], "high", 120);
   const minTargetGapFloor = Number.isFinite(atr) ? Math.max(atr * 0.6, 4) : 4;
+  const m15SupportLevel = Number(m15State?.levels?.support);
+  const m15ResistanceLevel = Number(m15State?.levels?.resistance);
   if (side === "long") {
     const levelSupport = Number(m5State?.levels?.support);
     const triggerLow = Number(triggerInfo?.stopAnchor);
     const baseSl = chooseDirectionalAnchor(
       entry,
-      [triggerLow, ...m5SellSideLiquidity, recentSwingLow, levelSupport],
+      [
+        triggerLow,
+        ...m5SellSideLiquidity,
+        recentSwingLow,
+        levelSupport,
+        ...m15SellSideLiquidity,
+        ...m15SwingLows,
+        m15SupportLevel,
+      ],
       "below",
       minStructureGap,
       maxStopDistance
@@ -1088,7 +1144,7 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
     const riskSeed = Number.isFinite(sl) ? Math.abs(entry - sl) : null;
     const minTargetGap = Math.max(
       minTargetGapFloor,
-      Number.isFinite(riskSeed) ? riskSeed * 0.35 : 0
+      Number.isFinite(riskSeed) ? riskSeed * 1.0 : 0
     );
     const maxTargetGap = Number.isFinite(riskSeed)
       ? Math.max(riskSeed * 3, Number.isFinite(atr) ? atr * 6 : 24)
@@ -1101,7 +1157,15 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
       .filter((value) => Number.isFinite(value) && value > entry)
       .sort((left, right) => left - right);
     const fullTarget = chooseDirectionalAnchor(entry, m15ResistanceCandidates, "above", minTargetGap, maxTargetGap);
-    tp = Number.isFinite(fullTarget) ? entry + (fullTarget - entry) * 0.5 : null;
+    const selectedTarget = chooseTakeProfit(entry, fullTarget, "long", riskSeed, minTargetGap);
+    tp = selectedTarget.value;
+    if (selectedTarget.mode === "scaled") {
+      tpDetail = "Scaled to 70% of nearest M15 target, capped to 5-15 points";
+    } else if (selectedTarget.mode === "floored") {
+      tpDetail = "Minimum target floor inside the 5-15 point band";
+    } else if (selectedTarget.mode === "full") {
+      tpDetail = "Full nearest M15 liquidity / swing target";
+    }
     if (!Number.isFinite(tp)) {
       const m30ResistanceCandidates = [
         ...m30SwingHighs,
@@ -1110,17 +1174,36 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
         .filter((value) => Number.isFinite(value) && value > entry)
         .sort((left, right) => left - right);
       const fullFallback = chooseDirectionalAnchor(entry, m30ResistanceCandidates, "above", minTargetGap, maxTargetGap);
-      tp = Number.isFinite(fullFallback) ? entry + (fullFallback - entry) * 0.5 : null;
-      if (Number.isFinite(tp)) {
-        tpDetail = "Halfway to nearest M30 fallback target";
+      const fallbackTarget = chooseTakeProfit(entry, fullFallback, "long", riskSeed, minTargetGap);
+      tp = fallbackTarget.value;
+      if (fallbackTarget.mode === "scaled") {
+        tpDetail = "Scaled to 70% of nearest M30 target, capped to 5-15 points";
+      } else if (fallbackTarget.mode === "floored") {
+        tpDetail = "Minimum target floor inside the 5-15 point band";
+      } else if (fallbackTarget.mode === "full") {
+        tpDetail = "Full nearest M30 fallback target";
       } else if (m15ResistanceCandidates.length) {
         const nearest = m15ResistanceCandidates[0];
-        tp = Number.isFinite(nearest) ? entry + (nearest - entry) * 0.5 : null;
-        tpDetail = "Halfway to nearest M15 liquidity / swing target";
+        const nearestTarget = chooseTakeProfit(entry, nearest, "long", riskSeed, minTargetGap);
+        tp = nearestTarget.value;
+        if (Number.isFinite(tp)) {
+          tpDetail = nearestTarget.mode === "full"
+            ? "Full nearest M15 liquidity / swing target"
+            : nearestTarget.mode === "scaled"
+              ? "Scaled to 70% of nearest M15 target, capped to 5-15 points"
+              : "Minimum target floor inside the 5-15 point band";
+        }
       } else if (m30ResistanceCandidates.length) {
         const nearest = m30ResistanceCandidates[0];
-        tp = Number.isFinite(nearest) ? entry + (nearest - entry) * 0.5 : null;
-        tpDetail = "Halfway to nearest M30 fallback target";
+        const nearestTarget = chooseTakeProfit(entry, nearest, "long", riskSeed, minTargetGap);
+        tp = nearestTarget.value;
+        if (Number.isFinite(tp)) {
+          tpDetail = nearestTarget.mode === "full"
+            ? "Full nearest M30 fallback target"
+            : nearestTarget.mode === "scaled"
+              ? "Scaled to 70% of nearest M30 target, capped to 5-15 points"
+              : "Minimum target floor inside the 5-15 point band";
+        }
       }
     }
   } else {
@@ -1128,7 +1211,15 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
     const triggerHigh = Number(triggerInfo?.stopAnchor);
     const baseSl = chooseDirectionalAnchor(
       entry,
-      [triggerHigh, ...m5BuySideLiquidity, recentSwingHigh, levelResistance],
+      [
+        triggerHigh,
+        ...m5BuySideLiquidity,
+        recentSwingHigh,
+        levelResistance,
+        ...m15BuySideLiquidity,
+        ...m15SwingHighs,
+        m15ResistanceLevel,
+      ],
       "above",
       minStructureGap,
       maxStopDistance
@@ -1151,7 +1242,7 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
     const riskSeed = Number.isFinite(sl) ? Math.abs(entry - sl) : null;
     const minTargetGap = Math.max(
       minTargetGapFloor,
-      Number.isFinite(riskSeed) ? riskSeed * 0.35 : 0
+      Number.isFinite(riskSeed) ? riskSeed * 1.0 : 0
     );
     const maxTargetGap = Number.isFinite(riskSeed)
       ? Math.max(riskSeed * 3, Number.isFinite(atr) ? atr * 6 : 24)
@@ -1164,7 +1255,15 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
       .filter((value) => Number.isFinite(value) && value < entry)
       .sort((left, right) => right - left);
     const fullTarget = chooseDirectionalAnchor(entry, m15SupportCandidates, "below", minTargetGap, maxTargetGap);
-    tp = Number.isFinite(fullTarget) ? entry - (entry - fullTarget) * 0.5 : null;
+    const selectedTarget = chooseTakeProfit(entry, fullTarget, "short", riskSeed, minTargetGap);
+    tp = selectedTarget.value;
+    if (selectedTarget.mode === "scaled") {
+      tpDetail = "Scaled to 70% of nearest M15 target, capped to 5-15 points";
+    } else if (selectedTarget.mode === "floored") {
+      tpDetail = "Minimum target floor inside the 5-15 point band";
+    } else if (selectedTarget.mode === "full") {
+      tpDetail = "Full nearest M15 liquidity / swing target";
+    }
     if (!Number.isFinite(tp)) {
       const m30SupportCandidates = [
         ...m30SwingLows,
@@ -1173,17 +1272,36 @@ function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
         .filter((value) => Number.isFinite(value) && value < entry)
         .sort((left, right) => right - left);
       const fullFallback = chooseDirectionalAnchor(entry, m30SupportCandidates, "below", minTargetGap, maxTargetGap);
-      tp = Number.isFinite(fullFallback) ? entry - (entry - fullFallback) * 0.5 : null;
-      if (Number.isFinite(tp)) {
-        tpDetail = "Halfway to nearest M30 fallback target";
+      const fallbackTarget = chooseTakeProfit(entry, fullFallback, "short", riskSeed, minTargetGap);
+      tp = fallbackTarget.value;
+      if (fallbackTarget.mode === "scaled") {
+        tpDetail = "Scaled to 70% of nearest M30 target, capped to 5-15 points";
+      } else if (fallbackTarget.mode === "floored") {
+        tpDetail = "Minimum target floor inside the 5-15 point band";
+      } else if (fallbackTarget.mode === "full") {
+        tpDetail = "Full nearest M30 fallback target";
       } else if (m15SupportCandidates.length) {
         const nearest = m15SupportCandidates[0];
-        tp = Number.isFinite(nearest) ? entry - (entry - nearest) * 0.5 : null;
-        tpDetail = "Halfway to nearest M15 liquidity / swing target";
+        const nearestTarget = chooseTakeProfit(entry, nearest, "short", riskSeed, minTargetGap);
+        tp = nearestTarget.value;
+        if (Number.isFinite(tp)) {
+          tpDetail = nearestTarget.mode === "full"
+            ? "Full nearest M15 liquidity / swing target"
+            : nearestTarget.mode === "scaled"
+              ? "Scaled to 70% of nearest M15 target, capped to 5-15 points"
+              : "Minimum target floor inside the 5-15 point band";
+        }
       } else if (m30SupportCandidates.length) {
         const nearest = m30SupportCandidates[0];
-        tp = Number.isFinite(nearest) ? entry - (entry - nearest) * 0.5 : null;
-        tpDetail = "Halfway to nearest M30 fallback target";
+        const nearestTarget = chooseTakeProfit(entry, nearest, "short", riskSeed, minTargetGap);
+        tp = nearestTarget.value;
+        if (Number.isFinite(tp)) {
+          tpDetail = nearestTarget.mode === "full"
+            ? "Full nearest M30 fallback target"
+            : nearestTarget.mode === "scaled"
+              ? "Scaled to 70% of nearest M30 target, capped to 5-15 points"
+              : "Minimum target floor inside the 5-15 point band";
+        }
       }
     }
   }
@@ -1399,8 +1517,10 @@ function calculateTradeOverview() {
   const shortScore = shortBaseScore;
   const longTriggerReady = ltfLong.passed;
   const shortTriggerReady = ltfShort.passed;
-  const longQualityGate = Boolean(m5EmaLong && (mtfLong.passed || htfLongAllowed) && (m15RsiLong || vwapLong));
-  const shortQualityGate = Boolean(m5EmaShort && (mtfShort.passed || htfShortAllowed) && (m15RsiShort || vwapShort));
+  const longMomentumPass = (m15RsiLong && vwapLong) || (m5RsiLong && vwapLong);
+  const shortMomentumPass = (m15RsiShort && vwapShort) || (m5RsiShort && vwapShort);
+  const longQualityGate = Boolean(m5EmaLong && htfLongAllowed && mtfLong.passed && longMomentumPass);
+  const shortQualityGate = Boolean(m5EmaShort && htfShortAllowed && mtfShort.passed && shortMomentumPass);
 
   let action = "No Trade";
   let score = Math.max(longScore, shortScore);
@@ -1568,6 +1688,7 @@ async function loadAutoTradeStatus() {
     setAutoTradeUi();
     renderCooldownLabel();
     renderActiveTradePanel();
+    saveWorkspaceSessionState();
   } catch (error) {
     bridgeStatus.textContent = "Auto route missing";
   }
@@ -1591,193 +1712,511 @@ async function saveAutoTradeConfig() {
 }
 
 function buildExecutionPayload() {
-  if (!latestTradeOverview || !String(latestTradeOverview.action || "").includes("Ready")) {
+  const review = aiBriefState.review;
+  if (!review || !review.should_trade) {
     return null;
   }
-  const side = String(latestTradeOverview.action).includes("Buy") ? "buy" : "sell";
-  const riskChecks = side === "buy" ? latestTradeOverview.longChecks?.risk : latestTradeOverview.shortChecks?.risk;
-  const lookup = (label) => riskChecks?.find((item) => item.label === label)?.raw ?? null;
+  const side = String(review.decision || "").trim().toLowerCase();
   const m5LastTime = Number(chartState.M5?.candles?.[chartState.M5.candles.length - 1]?.time);
-  const entry = lookup("Entry");
-  const sl = lookup("SL");
-  const tp = lookup("TP");
-  if (!Number.isFinite(m5LastTime) || !Number.isFinite(Number(entry)) || !Number.isFinite(Number(sl)) || !Number.isFinite(Number(tp))) {
+  const entryRaw = Number.isFinite(Number(review.entry)) ? Number(review.entry) : Number(review.suggested_entry);
+  const slRaw = Number.isFinite(Number(review.sl)) ? Number(review.sl) : Number(review.suggested_sl);
+  const tpRaw = Number.isFinite(Number(review.tp)) ? Number(review.tp) : Number(review.suggested_tp);
+  const entryIdx = Number.isFinite(Number(review.entry_idx)) ? Number(review.entry_idx) : null;
+  const slIdx = Number.isFinite(Number(review.sl_idx)) ? Number(review.sl_idx) : null;
+  const tpIdx = Number.isFinite(Number(review.tp_idx)) ? Number(review.tp_idx) : null;
+  if (!Number.isFinite(m5LastTime) || !Number.isFinite(Number(entryRaw)) || !Number.isFinite(Number(slRaw)) || !Number.isFinite(Number(tpRaw))) {
     return null;
   }
+  const entry = Number(entryRaw);
+  const sl = Number(slRaw);
+  const tp = Number(tpRaw);
+  if (side !== "buy" && side !== "sell") return null;
+  const validPlan = side === "buy" ? sl < entry && entry < tp : tp < entry && entry < sl;
+  if (!validPlan) return null;
   return {
     symbol: String(activeSymbolLabel.textContent || symbolInput.value || "XAUUSD").trim().toUpperCase(),
     side,
-    action: latestTradeOverview.action,
-    confidence: latestTradeOverview.score,
+    action: `AI ${side === "buy" ? "Buy" : "Sell"} Ready`,
     lot: Math.max(0.01, Number(autotradeLotInput?.value || autoTradeConfig.lot || 0.01)),
     entry,
     sl,
     tp,
-    signal_id: `${side}:${m5LastTime}`,
+    entry_idx: entryIdx,
+    sl_idx: slIdx,
+    tp_idx: tpIdx,
+    signal_id: `ai:${side}:${m5LastTime}:${modelSafeToken(normalizeAiModel())}`,
+    decision_key: String(review.signal_key || "").trim(),
+    ai_trade: review,
   };
 }
 
 async function maybeExecuteAutoTrade() {
-  if (!autoTradeConfig.enabled) return;
-  const payload = buildExecutionPayload();
-  if (!payload) return;
-  try {
-    const response = await fetch("/api/autotrade/evaluate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail || "Auto trade request failed.");
-    if (result.status === "placed") {
-      bridgeStatus.textContent = `${payload.side === "buy" ? "Buy" : "Sell"} sent`;
-      tradeActive = true;
-      activeTradeSnapshot = {
-        kind: "position",
-        ticket: result.ticket || activeTradeSnapshot?.ticket || "--",
-        symbol: payload.symbol,
-        side: payload.side,
-        volume: payload.lot,
-        price: payload.entry,
-        sl: payload.sl,
-        tp: payload.tp,
-      };
-      cooldownRemainingSeconds = 0;
-      renderCooldownLabel();
-      renderActiveTradePanel();
-      await loadAutoTradeStatus();
-    } else if (result.status === "blocked" || result.status === "rejected") {
-      bridgeStatus.textContent = result.detail || "Trade blocked";
-    } else if (result.status === "cooldown") {
-      bridgeStatus.textContent = "Auto cooldown";
-      tradeActive = false;
-      activeTradeSnapshot = null;
-      cooldownRemainingSeconds = Number(result.cooldown_remaining_seconds || cooldownRemainingSeconds || 0);
-      renderCooldownLabel();
-      renderActiveTradePanel();
-    } else if (result.status === "duplicate") {
-      bridgeStatus.textContent = "Signal already sent";
-    } else if (result.status === "disabled") {
-      bridgeStatus.textContent = "Auto disabled";
-    }
-  } catch (error) {
-    bridgeStatus.textContent = "Auto trade failed";
-  }
+  return;
 }
 
 function renderTradeOverview() {
-  const overview = calculateTradeOverview();
-  latestTradeOverview = overview;
-  overviewAction.textContent = overview.action;
-  overviewScore.textContent = `${overview.score}/100`;
-  overviewLongScore.textContent = `${overview.longScore}/100`;
-  overviewShortScore.textContent = `${overview.shortScore}/100`;
-  renderChecks(overviewLongChecks, overview.longChecks);
-  renderChecks(overviewShortChecks, overview.shortChecks);
-  overviewSummary.textContent = overview.summary;
-  renderIndicatorPanel();
+  latestTradeOverview = null;
+}
+
+function modelSafeToken(model) {
+  return String(model || "model").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase() || "model";
+}
+
+function normalizeAiModel() {
+  return "local-setup-engine";
+}
+
+function setAiStatus(text, available = false) {
+  aiBriefState.available = available;
+  if (aiStatusLabel) aiStatusLabel.textContent = text;
+}
+
+function setAiBriefText(content, meta, allowHtml = false) {
+  if (aiBriefContent) {
+    if (allowHtml) aiBriefContent.innerHTML = content;
+    else aiBriefContent.textContent = content;
+  }
+  if (aiBriefMeta) aiBriefMeta.textContent = meta;
+  saveWorkspaceSessionState();
+}
+
+async function buildBoardVisionImage() {
+  const canvases = TIMEFRAMES
+    .map((timeframe) => ({
+      timeframe,
+      canvas: domRefs[timeframe]?.canvas || null,
+      latest: chartState[timeframe]?.candles?.[chartState[timeframe].candles.length - 1] || null,
+      state: chartState[timeframe]?.marketState || null,
+      levels: chartState[timeframe]?.levels || null,
+    }))
+    .filter((item) => item.canvas && item.canvas.width > 0 && item.canvas.height > 0);
+
+  if (!canvases.length) return null;
+
+  const cardWidth = 360;
+  const cardHeight = 210;
+  const headerHeight = 42;
+  const gap = 12;
+  const columns = 2;
+  const rows = Math.ceil(canvases.length / columns);
+  const padding = 16;
+  const width = padding * 2 + columns * cardWidth + (columns - 1) * gap;
+  const height = padding * 2 + rows * (cardHeight + headerHeight) + (rows - 1) * gap + 34;
+
+  const surface = document.createElement("canvas");
+  surface.width = width;
+  surface.height = height;
+  const ctx = surface.getContext("2d");
+  if (!ctx) return null;
+
+  ctx.fillStyle = "#040811";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#edf4ff";
+  ctx.font = "bold 18px Segoe UI";
+  ctx.fillText(`Quantum | ${String(activeSymbolLabel.textContent || symbolInput.value || "XAUUSD").trim().toUpperCase()}`, padding, 26);
+  ctx.fillStyle = "#9ab0d3";
+  ctx.font = "12px Segoe UI";
+  ctx.fillText(`${new Date().toLocaleString()}`, padding, 44);
+
+  canvases.forEach((item, index) => {
+    const column = index % columns;
+    const row = Math.floor(index / columns);
+    const x = padding + column * (cardWidth + gap);
+    const y = padding + 56 + row * (cardHeight + headerHeight + gap);
+
+    ctx.fillStyle = "#0d1524";
+    ctx.fillRect(x, y, cardWidth, cardHeight + headerHeight);
+    ctx.strokeStyle = "rgba(145, 182, 255, 0.18)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, cardWidth, cardHeight + headerHeight);
+
+    ctx.fillStyle = "#edf4ff";
+    ctx.font = "bold 15px Segoe UI";
+    ctx.fillText(item.timeframe, x + 10, y + 22);
+    ctx.fillStyle = "#9ab0d3";
+    ctx.font = "11px Segoe UI";
+    const regime = item.state?.regime || "--";
+    const trend = item.state?.trend || "--";
+    const rangePosition = item.state?.rangePosition || "--";
+    const latestClose = item.latest ? formatPrice(item.latest.close) : "--";
+    ctx.fillText(`${regime} | ${trend} | ${rangePosition}`, x + 10, y + 36);
+
+    const support = item.levels?.support != null ? formatPrice(item.levels.support) : "--";
+    const resistance = item.levels?.resistance != null ? formatPrice(item.levels.resistance) : "--";
+    ctx.fillStyle = "#6fa4ff";
+    ctx.fillText(`S ${support}`, x + 10, y + cardHeight + headerHeight - 10);
+    ctx.fillStyle = "#ff7f7f";
+    ctx.fillText(`R ${resistance} | C ${latestClose}`, x + cardWidth - 150, y + cardHeight + headerHeight - 10);
+
+    ctx.drawImage(item.canvas, x + 8, y + headerHeight, cardWidth - 16, cardHeight - 12);
+  });
+
+  const dataUrl = surface.toDataURL("image/png");
+  return dataUrl.includes(",") ? dataUrl.split(",")[1] : null;
+}
+
+async function saveLatestBoardSnapshot() {
+  const image = await buildBoardVisionImage();
+  if (!image) return false;
+  try {
+    const response = await fetch("/api/ai/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image,
+        symbol: String(activeSymbolLabel.textContent || symbolInput.value || "XAUUSD").trim().toUpperCase(),
+      }),
+    });
+    if (!response.ok) return false;
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function buildAiTriggerFingerprint() {
+  const boundaryKey = getAiDecisionBoundaryKey();
+  return JSON.stringify({
+    model: normalizeAiModel(),
+    symbol: String(activeSymbolLabel.textContent || symbolInput.value || "XAUUSD").trim().toUpperCase(),
+    boundary: boundaryKey || "manual",
+  });
+}
+
+function getAiDecisionBoundaryKey(date = new Date()) {
+  const minutes = date.getMinutes();
+  const seconds = date.getSeconds();
+  if (minutes % 5 !== 0 || seconds > 20) return "";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(minutes).padStart(2, "0");
+  return `${year}-${month}-${day}T${hour}:${minute}`;
+}
+
+function getAiRefreshBoundaryKey(date = new Date()) {
+  const minutes = date.getMinutes();
+  if (minutes % 5 !== 0) return "";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(minutes).padStart(2, "0");
+  return `${year}-${month}-${day}T${hour}:${minute}`;
+}
+
+function normalizeAiList(value, fallback = []) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+  const text = String(value || "").trim();
+  return text ? [text] : fallback;
+}
+
+function normalizeIndicatorChecks(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => ({
+      label: String(item?.label || "").trim(),
+      expected: String(item?.expected || "").trim(),
+      actual: String(item?.actual ?? "").trim(),
+      passed: Boolean(item?.passed),
+    }))
+    .filter((item) => item.label);
+}
+
+function getTradePlanTone(decision) {
+  const side = String(decision || "").toLowerCase();
+  if (side === "buy") return { badge: "BUY THE PULLBACK", prefix: "BUY", tone: "is-buy" };
+  if (side === "sell") return { badge: "SELL THE POP", prefix: "SELL", tone: "is-sell" };
+  return { badge: "WAIT FOR CLEANER STRUCTURE", prefix: "WAIT", tone: "is-wait" };
+}
+
+function renderTradePlanHtml(payload) {
+  if (!payload) {
+    return `<div class="ai-plan-empty">${escapeHtml("No AI analysis returned.")}</div>`;
+  }
+
+  const tone = getTradePlanTone(payload.decision);
+  const isLivePlan = Boolean(payload.should_trade) && String(payload.trigger_state || "").toLowerCase() === "active_now";
+  const zoneText = String(payload.zone || "").trim()
+    || (Number.isFinite(Number(payload.entry)) ? formatPrice(payload.entry) : "")
+    || "No live zone yet";
+  const waitItems = normalizeAiList(payload.wait_for, [
+    String(payload.trigger || "").trim() || "Wait for a valid trigger.",
+  ]);
+  const whyItems = normalizeAiList(payload.why, [
+    String(payload.reason || "").trim()
+      || String(payload.location || "").trim()
+      || "No grounded reason returned.",
+  ]);
+  const avoidItems = normalizeAiList(payload.avoid, ["Do not force a trade."]);
+  const blockedItems = normalizeAiList(payload.blocked_reasons, []);
+  const indicatorChecks = normalizeIndicatorChecks(payload.indicator_checks);
+  const indicatorSummary = String(payload.indicator_summary || "").trim();
+  const tpItems = isLivePlan ? normalizeAiList(payload.tp_plan) : [];
+  if (isLivePlan && !tpItems.length && Number.isFinite(Number(payload.tp))) {
+    tpItems.push(`TP1: ${formatPrice(payload.tp)}`);
+  }
+
+  const setupLabel = (String(payload.setup || "").trim() || tone.badge).toUpperCase();
+  const entryText = String(payload.entry_note || "").trim()
+    || String(payload.plan || "").trim()
+    || (isLivePlan && Number.isFinite(Number(payload.entry))
+      ? `${String(payload.decision || "").toUpperCase()} near ${formatPrice(payload.entry)}`
+      : "Stand aside until the trigger is live.");
+  const slText = isLivePlan && Number.isFinite(Number(payload.sl))
+    ? formatPrice(payload.sl)
+    : "--";
+  const rrText = isLivePlan && Number.isFinite(Number(payload.rr)) ? Number(payload.rr).toFixed(2) : "--";
+  const triggerState = String(payload.trigger_state || "waiting").replaceAll("_", " ");
+  const contextText = String(payload.context_summary || "").trim()
+    || [payload.market_phase, payload.bias, payload.location].filter(Boolean).join(" | ")
+    || "Context still needs a clearer directional story.";
+  const triggerText = String(payload.trigger_summary || "").trim()
+    || String(payload.trigger || "").trim()
+    || "Waiting for trigger confirmation.";
+  const executionText = String(payload.execution_summary || "").trim()
+    || entryText;
+
+  return `
+    <article class="ai-plan-card ${tone.tone}">
+      <div class="ai-plan-topline">
+        <span class="ai-plan-kicker">Trade Plan</span>
+        <span class="ai-plan-trigger">Trigger: ${escapeHtml(triggerState.toUpperCase())}</span>
+      </div>
+      <h3 class="ai-plan-title"><span class="ai-plan-title-prefix">${escapeHtml(tone.prefix)}</span> ${escapeHtml(setupLabel)}</h3>
+      <div class="ai-plan-grid">
+        <section class="ai-plan-section">
+          <h4>Zone</h4>
+          <p class="ai-plan-zone">${escapeHtml(zoneText)}</p>
+        </section>
+        <section class="ai-plan-section">
+          <h4>Why</h4>
+          <ul>${whyItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>
+        <section class="ai-plan-section">
+          <h4>What to wait for</h4>
+          <ul>${waitItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>
+        <section class="ai-plan-section">
+          <h4>Entry</h4>
+          <p>${escapeHtml(entryText)}</p>
+        </section>
+        <section class="ai-plan-section ai-plan-breakdown">
+          <h4>Context</h4>
+          <p>${escapeHtml(contextText)}</p>
+        </section>
+        <section class="ai-plan-section ai-plan-breakdown">
+          <h4>Trigger</h4>
+          <p>${escapeHtml(triggerText)}</p>
+        </section>
+        <section class="ai-plan-section ai-plan-breakdown">
+          <h4>Execution</h4>
+          <p>${escapeHtml(executionText)}</p>
+        </section>
+        ${indicatorChecks.length ? `
+        <section class="ai-plan-section ai-plan-breakdown">
+          <h4>Decision Gate</h4>
+          ${indicatorSummary ? `<p>${escapeHtml(indicatorSummary)}</p>` : ""}
+          <ul>${indicatorChecks.map((item) => `<li>${escapeHtml(`${item.label}: ${item.actual} (need ${item.expected}) ${item.passed ? "PASS" : "WAIT"}`)}</li>`).join("")}</ul>
+        </section>` : ""}
+        <section class="ai-plan-stats">
+          <div class="ai-plan-stat">
+            <span>SL</span>
+            <strong>${escapeHtml(slText)}</strong>
+          </div>
+          <div class="ai-plan-stat">
+            <span>TP</span>
+            <strong>${tpItems.length ? escapeHtml(tpItems[0]) : "--"}</strong>
+          </div>
+          <div class="ai-plan-stat">
+            <span>R:R</span>
+            <strong>${escapeHtml(rrText)}</strong>
+          </div>
+        </section>
+        <section class="ai-plan-section">
+          <h4>Take profit plan</h4>
+          <ul>${(tpItems.length ? tpItems : [isLivePlan ? "No TP plan returned." : "Take profit stays hidden until the trigger is active."]).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>
+        <section class="ai-plan-section ai-plan-warning">
+          <h4>What you must NOT do</h4>
+          <ul>${avoidItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>
+        ${blockedItems.length ? `
+        <section class="ai-plan-section ai-plan-warning">
+          <h4>Blocked By</h4>
+          <ul>${blockedItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function simplifyCheck(item) {
+  if (!item) return null;
+  return {
+    label: item.label ?? "",
+    expected: item.expected ?? "",
+    actual: item.actual ?? "",
+    passed: Boolean(item.passed),
+    score: Number(item.score || 0),
+    value: item.value ?? "",
+    detail: item.detail ?? "",
+    raw: item.raw ?? null,
+  };
+}
+
+function buildAiSnapshot() {
+  const symbol = String(activeSymbolLabel.textContent || symbolInput.value || "XAUUSD").trim().toUpperCase() || "XAUUSD";
+  const timeframes = {};
+  for (const timeframe of TIMEFRAMES) {
+    const state = chartState[timeframe];
+    const latest = state?.candles?.[state.candles.length - 1] || null;
+    const candles = state?.candles || [];
+    const recentCandles = candles.slice(-6).map((candle) => ({
+      time: Number(candle.time),
+      open: Number(candle.open),
+      high: Number(candle.high),
+      low: Number(candle.low),
+      close: Number(candle.close),
+      tick_volume: Number(candle.tick_volume ?? 0),
+    }));
+    const latestClose = latest ? Number(latest.close) : null;
+    const support = Number(state?.levels?.support);
+    const resistance = Number(state?.levels?.resistance);
+    timeframes[timeframe] = {
+      latestClose,
+      latestTime: latest ? Number(latest.time) : null,
+      summary: state?.summary || null,
+      levels: state?.levels || null,
+      marketState: state?.marketState || null,
+      location: {
+        distanceToSupport: Number.isFinite(latestClose) && Number.isFinite(support) ? latestClose - support : null,
+        distanceToResistance: Number.isFinite(latestClose) && Number.isFinite(resistance) ? resistance - latestClose : null,
+      },
+      structure: {
+        buyLiquidity: getLiquidityPools(candles, "high", timeframe === "M1" ? 40 : 80).slice(-4),
+        sellLiquidity: getLiquidityPools(candles, "low", timeframe === "M1" ? 40 : 80).slice(-4),
+        swingHighs: getSwingCandidates(candles, "high", timeframe === "M1" ? 40 : 80).slice(-4),
+        swingLows: getSwingCandidates(candles, "low", timeframe === "M1" ? 40 : 80).slice(-4),
+      },
+      recentCandles,
+      volatility: {
+        atr14: state?.volatility?.atr14 ?? null,
+      },
+    };
+  }
+  return {
+    symbol,
+    generated_at: new Date().toISOString(),
+    market: {
+      bid: Number(lastTickSnapshot?.bid ?? 0) || null,
+      ask: Number(lastTickSnapshot?.ask ?? 0) || null,
+      last_price: Number(lastTickSnapshot?.last ?? chartState.M1?.candles?.[chartState.M1.candles.length - 1]?.close ?? 0) || null,
+      spread: Number.isFinite(Number(lastTickSnapshot?.ask)) && Number.isFinite(Number(lastTickSnapshot?.bid))
+        ? Number(lastTickSnapshot.ask) - Number(lastTickSnapshot.bid)
+        : null,
+      session: getSessionLabel(),
+    },
+    timeframes,
+  };
+}
+
+async function loadAiStatus() {
+  try {
+    const response = await fetch("/api/ai/status", { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || "Failed to reach AI bridge.");
+    const engine = String(payload.decision_engine || "local").trim().toLowerCase();
+    const engineLabel = engine === "local" ? "Local Strategy Engine" : "Decision Engine";
+    const label = payload.available ? "Connected" : "Offline";
+    const model = payload.default_model || "local-setup-engine";
+    setAiStatus(label, Boolean(payload.available));
+    const autonomous = payload?.autonomous || null;
+    const autonomousReview = autonomous?.last_result || null;
+    if (autonomousReview && typeof autonomousReview === "object" && autonomousReview.decision) {
+      aiBriefState.review = autonomousReview;
+      const decision = String(autonomousReview.decision || "no_trade").toUpperCase();
+      const updatedAt = autonomous.last_run_at
+        ? new Date(autonomous.last_run_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+        : "--:--:--";
+      setAiBriefText(
+        renderTradePlanHtml(autonomousReview),
+        `Engine: ${autonomous.decision_engine || engineLabel} | Model: ${autonomous.model || autonomousReview.model || model} | Decision: ${decision} | Updated: ${updatedAt}`,
+        true
+      );
+    }
+    if (!payload.available) {
+      setAiBriefText(
+        `${engineLabel} is not connected yet.`,
+        `Engine: ${engineLabel} | Model: ${model}`
+      );
+    }
+  } catch (error) {
+    setAiStatus("Offline", false);
+    setAiBriefText(
+      "AI bridge is unavailable right now.",
+      "The trading board still works normally, but AI auto-trading is unavailable."
+    );
+  }
+}
+
+async function requestAiBrief(force = false) {
+  if (aiBriefState.inFlight) return null;
+
+  const model = normalizeAiModel();
+  const snapshot = buildAiSnapshot();
+  const nextHash = buildAiTriggerFingerprint();
+  if (!force && aiBriefState.lastHash === nextHash) return aiBriefState.review;
+
+  aiBriefState.inFlight = true;
+  aiBriefState.lastHash = nextHash;
+  if (refreshAiBriefButton) refreshAiBriefButton.disabled = true;
+  setAiBriefText("Requesting live trade decision from the server...", `Engine: Local Strategy Engine | Input: live board context`);
+
+  try {
+    const response = await fetch("/api/ai/trade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        board: snapshot,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || "AI brief request failed.");
+    setAiStatus("Connected", true);
+    aiBriefState.review = payload;
+    const decision = String(payload.decision || "no_trade").toUpperCase();
+    setAiBriefText(
+      renderTradePlanHtml(payload),
+      `Engine: Local Strategy Engine | Model: ${payload.model || model} | Decision: ${decision} | Updated: ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })}`,
+      true
+    );
+    return payload;
+  } catch (error) {
+    setAiStatus("Offline", false);
+    aiBriefState.review = null;
+    setAiBriefText(
+      error.message || "AI brief request failed.",
+      "The server could not produce a fresh trade decision."
+    );
+    return null;
+  } finally {
+    aiBriefState.inFlight = false;
+    if (refreshAiBriefButton) refreshAiBriefButton.disabled = false;
+  }
 }
 
 function refreshDerivedState(state) {
   state.levels = calculateLevels(state.candles);
   state.marketState = calculateMarketState(state.candles);
-  state.indicators = calculateIndicators(state.candles);
-}
-
-function getIndicatorToneClass(type, value) {
-  if (type === "ema") {
-    if (value === "Bull Stack") return "tone-bull";
-    if (value === "Bear Stack") return "tone-bear";
-    return "tone-range";
-  }
-  if (type === "rsi") {
-    if (value === "Bullish") return "tone-bull";
-    if (value === "Bearish") return "tone-bear";
-    return "tone-range";
-  }
-  if (type === "adx") {
-    if (value === "Strong") return "tone-bull";
-    if (value === "Building") return "tone-transition";
-    return "tone-range";
-  }
-  if (type === "vwap") {
-    if (value === "Above") return "tone-bull";
-    if (value === "Below") return "tone-bear";
-    return "tone-range";
-  }
-  return "tone-range";
-}
-
-function renderIndicatorPanel() {
-  if (!indicatorGrid) return;
-  indicatorGrid.innerHTML = "";
-  for (const timeframe of TIMEFRAMES) {
-    const indicators = chartState[timeframe]?.indicators;
-    const card = document.createElement("section");
-    card.className = "indicator-card";
-    if (!indicators) {
-      card.innerHTML = `
-        <div class="indicator-card-header">
-          <h4>${timeframe}</h4>
-          <span>Waiting</span>
-        </div>
-      `;
-      indicatorGrid.appendChild(card);
-      continue;
-    }
-
-    const rows = [
-      {
-        label: "EMA 9/20/50",
-        value: indicators.emaState,
-        detail: `${formatPrice(indicators.ema9)} / ${formatPrice(indicators.ema20)} / ${formatPrice(indicators.ema50)}`,
-        tone: getIndicatorToneClass("ema", indicators.emaState),
-      },
-      {
-        label: "RSI 14",
-        value: `${indicators.rsiState} ${Number.isFinite(indicators.rsi14) ? indicators.rsi14.toFixed(1) : "--"}`,
-        detail: "Bull > 55 | Bear < 45",
-        tone: getIndicatorToneClass("rsi", indicators.rsiState),
-      },
-      {
-        label: "ADX 14",
-        value: `${indicators.adxState} ${Number.isFinite(indicators.adx14) ? indicators.adx14.toFixed(1) : "--"}`,
-        detail: "Strong >= 25 | Build >= 20",
-        tone: getIndicatorToneClass("adx", indicators.adxState),
-      },
-      {
-        label: "ATR 14",
-        value: formatPrice(indicators.atr14),
-        detail: "Live volatility buffer",
-        tone: "tone-range",
-      },
-      {
-        label: "VWAP",
-        value: `${indicators.vwapState} ${formatPrice(indicators.vwap)}`,
-        detail: `Close ${formatPrice(indicators.latestClose)}`,
-        tone: getIndicatorToneClass("vwap", indicators.vwapState),
-      },
-    ];
-
-    card.innerHTML = `
-      <div class="indicator-card-header">
-        <h4>${timeframe}</h4>
-        <span>${chartState[timeframe]?.marketState?.regime ?? "--"}</span>
-      </div>
-      <div class="indicator-rows">
-        ${rows.map((row) => `
-          <div class="indicator-row ${row.tone}">
-            <div>
-              <strong>${row.label}</strong>
-              <p>${row.detail}</p>
-            </div>
-            <span>${row.value}</span>
-          </div>
-        `).join("")}
-      </div>
-    `;
-    indicatorGrid.appendChild(card);
-  }
+  state.indicators = null;
+  state.volatility = {
+    atr14: calculateATR(state.candles, 14),
+  };
 }
 
 function setTrendBadge(element, trend) {
@@ -2022,6 +2461,7 @@ function mergeRecentCandles(existingCandles, incomingCandles) {
 }
 
 function applyLiveTickToCharts(tickPayload) {
+  lastTickSnapshot = tickPayload || null;
   const livePrice = Number(tickPayload?.last || tickPayload?.bid || tickPayload?.ask || 0);
   if (!Number.isFinite(livePrice) || livePrice <= 0) return;
   for (const timeframe of TIMEFRAMES) {
@@ -2039,9 +2479,9 @@ function applyLiveTickToCharts(tickPayload) {
       state.summary.range_high = Math.max(Number(state.summary.range_high), livePrice);
       state.summary.range_low = Math.min(Number(state.summary.range_low), livePrice);
     }
-    refreshDerivedState(state);
+    updateCardMeta(timeframe);
+    drawChart(timeframe);
   }
-  renderBoard();
   maybeExecuteAutoTrade();
 }
 
@@ -2076,6 +2516,12 @@ async function loadBoard() {
       bridgeStatus.textContent = loadedCount === TIMEFRAMES.length ? "Live" : `Syncing ${loadedCount}/${TIMEFRAMES.length}`;
     }
     await maybeExecuteAutoTrade();
+    await saveLatestBoardSnapshot();
+    if (!aiBriefState.hasAutoLoaded) {
+      aiBriefState.hasAutoLoaded = true;
+      await loadAiStatus();
+    }
+    saveWorkspaceSessionState();
   } catch (error) {
     bridgeStatus.textContent = "Error";
     for (const timeframe of TIMEFRAMES) {
@@ -2105,6 +2551,7 @@ async function syncRecentBoard() {
     renderBoard();
     await maybeExecuteAutoTrade();
     await loadAutoTradeStatus();
+    saveWorkspaceSessionState();
   } catch (error) {
     // Keep board usable if a sync cycle fails.
   }
@@ -2117,6 +2564,7 @@ async function loadTick() {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || "Failed to load live tick.");
     if (payload.symbol) activeSymbolLabel.textContent = payload.symbol;
+    lastTickSnapshot = payload;
     applyLiveTickToCharts(payload);
   } catch (error) {
     // Ignore intermittent tick errors.
@@ -2133,6 +2581,29 @@ function startTickSync() {
   if (tickRefreshHandle) clearInterval(tickRefreshHandle);
   if (!autoRefreshEnabled) return;
   tickRefreshHandle = window.setInterval(loadTick, TICK_SYNC_MS);
+}
+
+function startSnapshotSync() {
+  if (snapshotRefreshHandle) clearInterval(snapshotRefreshHandle);
+  if (!autoRefreshEnabled) return;
+  snapshotRefreshHandle = window.setInterval(() => {
+    saveLatestBoardSnapshot();
+  }, SNAPSHOT_SYNC_MS);
+}
+
+function startAiBriefAutoRefresh() {
+  if (aiBriefAutoRefreshHandle) clearInterval(aiBriefAutoRefreshHandle);
+  if (!autoRefreshEnabled) return;
+  aiBriefAutoRefreshHandle = window.setInterval(loadAiStatus, 10000);
+}
+
+function refreshWorkspaceStatusOnResume() {
+  const hasRecentCache = Boolean(aiBriefState.review || lastTickSnapshot || chartState.M1?.candles?.length);
+  bridgeStatus.textContent = hasRecentCache ? "Live" : "Syncing";
+  syncRecentBoard();
+  loadTick();
+  loadAiStatus();
+  loadAutoTradeStatus();
 }
 
 function jumpAllToNewest() {
@@ -2163,16 +2634,17 @@ function setCollapsedState(target, collapsed, button, expandedLabel = "-", colla
   target.classList.toggle("is-collapsed", collapsed);
   button.textContent = collapsed ? collapsedLabel : expandedLabel;
   button.setAttribute("aria-expanded", String(!collapsed));
-}
-
-function toggleTradeOverviewCollapsed() {
-  const collapsed = !tradeOverviewElement?.classList.contains("is-collapsed");
-  setCollapsedState(tradeOverviewElement, collapsed, tradeOverviewToggle);
+  saveWorkspaceSessionState();
 }
 
 function toggleAutoTradePanelCollapsed() {
   const collapsed = !autotradePanelElement?.classList.contains("is-collapsed");
   setCollapsedState(autotradePanelElement, collapsed, autotradePanelToggle);
+}
+
+function toggleAiBriefCollapsed() {
+  const collapsed = !aiBriefPanelElement?.classList.contains("is-collapsed");
+  setCollapsedState(aiBriefPanelElement, collapsed, aiBriefToggle);
 }
 
 function toggleChartCollapsed(timeframe) {
@@ -2266,6 +2738,11 @@ window.addEventListener("resize", () => {
   resizeCanvases();
   renderBoard();
 });
+window.addEventListener("pageshow", refreshWorkspaceStatusOnResume);
+window.addEventListener("focus", refreshWorkspaceStatusOnResume);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") refreshWorkspaceStatusOnResume();
+});
 
 refreshButton?.addEventListener("click", loadBoard);
 jumpNewestButton?.addEventListener("click", jumpAllToNewest);
@@ -2277,9 +2754,13 @@ toggleMotionButton?.addEventListener("click", (event) => {
   event.currentTarget.textContent = autoRefreshEnabled ? "Pause Live Sync" : "Resume Live Sync";
   startLiveSync();
   startTickSync();
+  startAiBriefAutoRefresh();
 });
-tradeOverviewToggle?.addEventListener("click", toggleTradeOverviewCollapsed);
 autotradePanelToggle?.addEventListener("click", toggleAutoTradePanelCollapsed);
+aiBriefToggle?.addEventListener("click", toggleAiBriefCollapsed);
+refreshAiBriefButton?.addEventListener("click", () => {
+  requestAiBrief(true);
+});
 autotradeToggleButton?.addEventListener("click", async () => {
   autoTradeConfig.enabled = !autoTradeConfig.enabled;
   setAutoTradeUi();
@@ -2301,6 +2782,12 @@ autotradeLotInput?.addEventListener("change", async () => {
     bridgeStatus.textContent = "Lot save failed";
   }
 });
+contentScrollElement?.addEventListener("scroll", () => {
+  saveWorkspaceSessionState();
+});
+window.addEventListener("beforeunload", () => {
+  saveWorkspaceSessionState();
+});
 
 buildBoard();
 for (const timeframe of TIMEFRAMES) bindChartInteractions(timeframe);
@@ -2312,7 +2799,15 @@ startCooldownTicker();
 resizeCanvases();
 renderBoard();
 setAutoTradeUi();
+const restoredWorkspace = restoreWorkspaceSessionState();
 loadAutoTradeStatus();
-loadBoard();
+loadAiStatus();
+if (restoredWorkspace) {
+  syncRecentBoard();
+} else {
+  loadBoard();
+}
 startLiveSync();
 startTickSync();
+startSnapshotSync();
+startAiBriefAutoRefresh();

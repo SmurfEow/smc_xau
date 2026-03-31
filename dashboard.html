@@ -4,9 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Quantum Profit Dashboard</title>
-    <link rel="stylesheet" href="styles.css?v=20260325c" />
+    <link rel="stylesheet" href="styles.css?v=20260331h" />
   </head>
   <body>
+    <div class="cosmic-scene" aria-hidden="true">
+      <div class="cosmic-stars"></div>
+      <div class="cosmic-moon"></div>
+      <div class="cosmic-craft">
+        <div class="cosmic-craft-window"></div>
+        <div class="cosmic-craft-door"></div>
+        <div class="cosmic-craft-glow"></div>
+      </div>
+    </div>
     <div class="dashboard-shell">
       <header class="topbar glass">
         <div class="brand-block">
@@ -72,10 +81,10 @@
             <h2 id="all-net-value">--</h2>
             <p id="all-breakdown-copy">--</p>
           </article>
-          <article class="summary-card glass">
-            <p class="eyebrow">Latest Result</p>
-            <h3 id="latest-result-value">--</h3>
-            <p id="latest-result-copy">Waiting for closed deals...</p>
+          <article id="missed-trades-card" class="summary-card glass">
+            <p class="eyebrow">Missed Trades</p>
+            <h3 id="missed-trades-value">--</h3>
+            <p id="missed-trades-copy">Waiting for strategy analytics...</p>
           </article>
         </section>
 
@@ -83,8 +92,8 @@
           <article class="analytics-card glass">
             <div class="history-panel-header">
               <div>
-                <p class="eyebrow">Pulse</p>
-                <h2>Outcome Snapshot</h2>
+                <p class="eyebrow">Analytics</p>
+                <h2>Entry Readiness</h2>
               </div>
               <p id="snapshot-copy">Waiting for data...</p>
             </div>
@@ -93,12 +102,12 @@
           <article class="analytics-card glass">
             <div class="history-panel-header">
               <div>
-                <p class="eyebrow">Flow</p>
-                <h2>Close-Time Rhythm</h2>
+                <p class="eyebrow">Sessions</p>
+                <h2>Entry Session Performance</h2>
               </div>
-              <p id="hourly-copy">Waiting for data...</p>
+              <p id="session-copy">Waiting for data...</p>
             </div>
-            <div id="hourly-chart" class="bars-chart"></div>
+            <div id="session-chart" class="bars-chart"></div>
           </article>
         </section>
 
@@ -116,12 +125,38 @@
           <article class="analytics-card glass">
             <div class="history-panel-header">
               <div>
-                <p class="eyebrow">Performance Lenses</p>
-                <h2>What To Change</h2>
+                <p class="eyebrow">Strategy Performance</p>
+                <h2>Setup Performance</h2>
               </div>
-              <p id="type-stats-copy">Waiting for data...</p>
+              <p id="setup-performance-copy">Waiting for data...</p>
             </div>
-            <div id="type-stats-chart" class="type-stats-chart"></div>
+            <div id="setup-performance-chart" class="type-stats-chart"></div>
+          </article>
+        </section>
+
+        <section class="analytics-grid">
+          <article class="analytics-card glass">
+            <div class="history-panel-header">
+              <div>
+                <p class="eyebrow">Visualization</p>
+                <h2>Setup x Session Heatmap</h2>
+              </div>
+              <p id="setup-heatmap-copy">Waiting for data...</p>
+            </div>
+            <div id="setup-heatmap-chart" class="type-stats-chart"></div>
+          </article>
+          <article class="analytics-card glass">
+            <div class="history-panel-header">
+              <div>
+                <p class="eyebrow">Execution Lens</p>
+                <h2>Entry Quality & Families</h2>
+              </div>
+              <p id="ai-friction-copy">Waiting for strategy data...</p>
+            </div>
+            <div class="ai-analytics-stack">
+              <div id="ai-blocked-chart" class="bars-chart"></div>
+              <div id="ai-setup-chart" class="type-stats-chart"></div>
+            </div>
           </article>
         </section>
 
@@ -140,6 +175,7 @@
                   <th>Time</th>
                   <th>Symbol</th>
                   <th>Ticket</th>
+                  <th>AI</th>
                   <th>Type</th>
                   <th>Volume</th>
                   <th>Price</th>
@@ -153,7 +189,7 @@
               </thead>
               <tbody id="history-table-body">
                 <tr>
-                  <td colspan="12">Loading MT5 history...</td>
+                  <td colspan="13">Loading MT5 history...</td>
                 </tr>
               </tbody>
             </table>
@@ -162,6 +198,6 @@
       </section>
     </div>
 
-    <script src="dashboard.js?v=20260325c"></script>
+    <script src="dashboard.js?v=20260331c"></script>
   </body>
 </html>

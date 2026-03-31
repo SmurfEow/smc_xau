@@ -4,9 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Quantum Terminal</title>
-    <link rel="stylesheet" href="styles.css?v=20260324e" />
+    <link rel="stylesheet" href="styles.css?v=20260331h" />
   </head>
   <body>
+    <div class="cosmic-scene" aria-hidden="true">
+      <div class="cosmic-stars"></div>
+      <div class="cosmic-moon"></div>
+      <div class="cosmic-craft">
+        <div class="cosmic-craft-window"></div>
+        <div class="cosmic-craft-door"></div>
+        <div class="cosmic-craft-glow"></div>
+      </div>
+    </div>
     <div class="shell">
       <header class="topbar glass">
         <div class="brand-block">
@@ -100,45 +109,26 @@
             </div>
           </div>
         </section>
-        <section id="trade-overview" class="trade-overview glass">
-          <div class="trade-overview-header">
+        <section id="ai-brief-panel" class="ai-brief-panel glass">
+          <div class="ai-brief-header">
             <div>
-              <p class="eyebrow">Trade Engine</p>
-              <h2 id="overview-action">No Trade</h2>
+              <p class="eyebrow">Decision Layer</p>
+              <h2>Strategy Trader</h2>
             </div>
-            <div class="trade-overview-controls">
-              <div class="overview-score-block">
-                <span>Confidence</span>
-                <strong id="overview-score">0</strong>
+            <div class="ai-brief-controls">
+              <div class="ai-brief-status-pill">
+                <span>Engine</span>
+                <strong id="ai-status-label">Checking</strong>
               </div>
-              <button id="trade-overview-toggle" class="collapse-button" type="button" aria-expanded="true">-</button>
+              <button id="ai-brief-toggle" class="collapse-button" type="button" aria-expanded="true">-</button>
             </div>
           </div>
-          <div class="trade-overview-body">
-            <div class="overview-sides">
-              <section class="overview-side overview-side-long">
-                <div class="overview-side-header">
-                  <h3>Long</h3>
-                  <strong id="overview-long-score">0</strong>
-                </div>
-                <div class="overview-checks" id="overview-long-checks"></div>
-              </section>
-              <section class="overview-side overview-side-short">
-                <div class="overview-side-header">
-                  <h3>Short</h3>
-                  <strong id="overview-short-score">0</strong>
-                </div>
-                <div class="overview-checks" id="overview-short-checks"></div>
-              </section>
+          <div class="ai-brief-body">
+            <div class="ai-brief-toolbar">
+              <button id="refresh-ai-brief" class="action-button primary" type="button">Refresh Trade Setup</button>
             </div>
-            <section class="indicator-panel">
-              <div class="indicator-panel-header">
-                <h3>Live Indicator Thresholds</h3>
-                <p>EMA, RSI, ADX, ATR, and VWAP across the active timeframes.</p>
-              </div>
-              <div id="indicator-grid" class="indicator-grid"></div>
-            </section>
-            <p id="overview-summary" class="overview-summary">Waiting for enough timeframe data to evaluate trade readiness.</p>
+            <p id="ai-brief-meta" class="ai-brief-meta">The server reads the live board context and produces a local structure-based trade setup with levels and reasoning.</p>
+            <div id="ai-brief-content" class="ai-brief-content">Waiting for the latest autonomous local trade decision from the server.</div>
           </div>
         </section>
 
@@ -146,6 +136,6 @@
       </section>
     </div>
 
-    <script src="app.js?v=20260324e"></script>
+    <script src="app.js?v=20260330b"></script>
   </body>
 </html>
