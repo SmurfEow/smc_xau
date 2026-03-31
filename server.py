@@ -65,6 +65,7 @@ STRUCTURE_ENGINE_MODEL_NAME = "structure-engine"
 AUTONOMOUS_AI_SYMBOL = os.environ.get("AUTONOMOUS_AI_SYMBOL", "XAUUSD").strip() or "XAUUSD"
 AUTONOMOUS_AI_MODEL = os.environ.get("AUTONOMOUS_AI_MODEL", OLLAMA_DEFAULT_MODEL).strip() or OLLAMA_DEFAULT_MODEL
 AUTONOMOUS_AI_INTERVAL_SECONDS = 5 * 60
+GOOGLE_SHEET_SYNC_INTERVAL_SECONDS = 60
 AUTONOMOUS_AI_CONTEXT_BARS = 240
 AUTONOMOUS_AI_STATE = {
     "enabled": True,
@@ -789,6 +790,33 @@ def clamp_target(entry: float, raw_target: float | None, side: str) -> float | N
     return round(entry + distance, 2) if side == "buy" else round(entry - distance, 2)
 
 
+def setup_family_limits(setup_type: str) -> dict[str, float]:
+    if setup_type in {"buy_pullback", "sell_pullback"}:
+        return {"stop_min": 4.5, "stop_max": 10.0, "tp_min": 5.0, "tp_max": 10.0}
+    if setup_type in {"breakout_buy", "breakdown_sell"}:
+        return {"stop_min": 5.0, "stop_max": 12.0, "tp_min": 8.0, "tp_max": 15.0}
+    if setup_type in {"failed_breakout_sell", "failed_breakdown_buy"}:
+        return {"stop_min": 4.0, "stop_max": 8.0, "tp_min": 5.0, "tp_max": 10.0}
+    if setup_type in {"range_buy", "range_sell"}:
+        return {"stop_min": 4.0, "stop_max": 10.0, "tp_min": 5.0, "tp_max": 10.0}
+    return {"stop_min": 4.5, "stop_max": 10.0, "tp_min": 5.0, "tp_max": 10.0}
+
+
+def clamp_stop_distance(entry: float, sl: float, side: str, setup_type: str) -> float:
+    limits = setup_family_limits(setup_type)
+    fixed_distance = limits["stop_max"]
+    return round(entry - fixed_distance, 2) if side == "buy" else round(entry + fixed_distance, 2)
+
+
+def clamp_target_by_setup(entry: float, raw_target: float | None, side: str, setup_type: str) -> float | None:
+    if raw_target is None:
+        return None
+    limits = setup_family_limits(setup_type)
+    distance = abs(raw_target - entry)
+    distance = min(max(distance, limits["tp_min"]), limits["tp_max"])
+    return round(entry + distance, 2) if side == "buy" else round(entry - distance, 2)
+
+
 def build_zone_text(levels: list[float], entry: float, side: str, atr_value: float) -> str:
     unique_levels = sorted({round(float(value), 2) for value in levels if value is not None})
     if not unique_levels:
@@ -1046,6 +1074,46 @@ def detect_compression_breakout(side: str, level: float | None, m5_candles: list
     return {"passed": passed, "detail": f"Compression breakdown below {level:.2f}" if passed else f"No bearish compression breakdown below {level:.2f}"}
 
 
+def detect_strong_breakout_impulse(
+    side: str,
+    level: float | None,
+    m5_candles: list[dict[str, float | int]],
+    m1_candles: list[dict[str, float | int]],
+) -> dict[str, object]:
+    if level is None or len(m5_candles) < 5 or len(m1_candles) < 2:
+        return {"passed": False, "detail": "Need clearer breakout impulse"}
+    compression = m5_candles[-5:-2]
+    prev = m5_candles[-2]
+    last = m5_candles[-1]
+    m1_last = m1_candles[-1]
+    avg_range = sum(abs(float(c["high"]) - float(c["low"])) for c in compression) / len(compression)
+    prev_range = abs(float(prev["high"]) - float(prev["low"]))
+    last_range = abs(float(last["high"]) - float(last["low"]))
+    if avg_range <= 0:
+        return {"passed": False, "detail": "Need clearer breakout impulse"}
+    if side == "buy":
+        broke = float(prev["close"]) > level and float(last["close"]) > level
+        expansion = max(prev_range, last_range) >= avg_range * 1.9
+        strong_close = (
+            float(prev["close"]) >= float(prev["high"]) - max(prev_range * 0.35, 1.0)
+            and float(last["close"]) >= float(last["high"]) - max(last_range * 0.35, 1.0)
+        )
+        follow_through = float(last["close"]) >= float(prev["close"]) - 1.2
+        m1_confirm = float(m1_last["close"]) >= float(m1_last["open"]) and float(m1_last["close"]) >= level
+        passed = broke and expansion and strong_close and follow_through and m1_confirm
+        return {"passed": passed, "detail": f"Strong impulse breakout above {level:.2f}" if passed else f"No strong bullish impulse above {level:.2f}"}
+    broke = float(prev["close"]) < level and float(last["close"]) < level
+    expansion = max(prev_range, last_range) >= avg_range * 1.9
+    strong_close = (
+        float(prev["close"]) <= float(prev["low"]) + max(prev_range * 0.35, 1.0)
+        and float(last["close"]) <= float(last["low"]) + max(last_range * 0.35, 1.0)
+    )
+    follow_through = float(last["close"]) <= float(prev["close"]) + 1.2
+    m1_confirm = float(m1_last["close"]) <= float(m1_last["open"]) and float(m1_last["close"]) <= level
+    passed = broke and expansion and strong_close and follow_through and m1_confirm
+    return {"passed": passed, "detail": f"Strong impulse breakdown below {level:.2f}" if passed else f"No strong bearish impulse below {level:.2f}"}
+
+
 def detect_double_level_reaction(side: str, level: float | None, m5_candles: list[dict[str, float | int]]) -> dict[str, object]:
     if level is None or len(m5_candles) < 6:
         return {"passed": False, "detail": "Need clearer double reaction"}
@@ -1276,17 +1344,21 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
                 sl = local_breakout_stop(side="buy", entry=entry, level=nearest_resistance, m5_candles=m5_candles, buffer=buffer, atr_value=atr_value)
             else:
                 sl = local_pullback_stop(side="buy", entry=entry, m5_candles=m5_candles, nearby_level=nearest_support, buffer=buffer, atr_value=atr_value)
+            sl = clamp_stop_distance(entry, sl, "buy", setup_type)
             raw_target = choose_target(entry, "buy", resistance_zone + [value for value in support_zone if value > entry])
-            tp1 = clamp_target(entry, raw_target if raw_target is not None else entry + max(6.0, abs(entry - sl) * 1.2), "buy")
-            tp2 = round(entry + min(max(abs(tp1 - entry) * 1.35, 7.0), 15.0), 2) if tp1 is not None else None
+            fallback_target = entry + max(setup_family_limits(setup_type)["tp_min"], abs(entry - sl) * 1.2)
+            tp1 = clamp_target_by_setup(entry, raw_target if raw_target is not None else fallback_target, "buy", setup_type)
+            tp2 = round(entry + min(max(abs(tp1 - entry) * 1.35, setup_family_limits(setup_type)["tp_min"] + 2.0), setup_family_limits(setup_type)["tp_max"]), 2) if tp1 is not None else None
         else:
             if setup_type == "breakdown_sell":
                 sl = local_breakout_stop(side="sell", entry=entry, level=nearest_support, m5_candles=m5_candles, buffer=buffer, atr_value=atr_value)
             else:
                 sl = local_pullback_stop(side="sell", entry=entry, m5_candles=m5_candles, nearby_level=nearest_resistance, buffer=buffer, atr_value=atr_value)
+            sl = clamp_stop_distance(entry, sl, "sell", setup_type)
             raw_target = choose_target(entry, "sell", support_zone + [value for value in resistance_zone if value < entry])
-            tp1 = clamp_target(entry, raw_target if raw_target is not None else entry - max(6.0, abs(entry - sl) * 1.2), "sell")
-            tp2 = round(entry - min(max(abs(entry - tp1) * 1.35, 7.0), 15.0), 2) if tp1 is not None else None
+            fallback_target = entry - max(setup_family_limits(setup_type)["tp_min"], abs(entry - sl) * 1.2)
+            tp1 = clamp_target_by_setup(entry, raw_target if raw_target is not None else fallback_target, "sell", setup_type)
+            tp2 = round(entry - min(max(abs(entry - tp1) * 1.35, setup_family_limits(setup_type)["tp_min"] + 2.0), setup_family_limits(setup_type)["tp_max"]), 2) if tp1 is not None else None
         if not entry_matches_setup_zone(entry=entry, side=side, setup_type=setup_type, zone_text=zone_text, atr_value=atr_value):
             return
         rr = round(abs(tp1 - entry) / abs(entry - sl), 2) if tp1 is not None and entry != sl else 0.0
@@ -1307,11 +1379,10 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
 
     if bias == "bullish":
         add_candidate("buy", "buy_pullback", detect_pullback_continuation("buy", nearest_support, nearest_resistance, m5_candles, m1_candles), 78, "Bullish context, support-side pullback, and lower timeframe recovery are aligned.", pullback_buy_zone, "support")
-        add_candidate("buy", "breakout_buy", detect_breakout_hold("buy", nearest_resistance, m5_candles, m1_candles), 72, "Bullish breakout is holding above resistance.", f"Above {nearest_resistance:.2f}" if nearest_resistance is not None else "Breakout zone", "breakout_zone")
         add_candidate("buy", "failed_breakdown_buy", detect_failed_break("buy", nearest_support, m5_candles, m1_candles), 74, "Support was swept and reclaimed with bullish timing.", pullback_buy_zone, "support")
         add_candidate("buy", "breakout_buy", detect_retest_hold("buy", nearest_resistance, m5_candles, m1_candles), 76, "Resistance broke, retested, and held as support.", f"Retest around {nearest_resistance:.2f}" if nearest_resistance is not None else "Retest zone", "breakout_zone")
+        add_candidate("buy", "breakout_buy", detect_strong_breakout_impulse("buy", nearest_resistance, m5_candles, m1_candles), 72, "Breakout is expanding with strong follow-through, so immediate continuation entry is acceptable.", f"Above {nearest_resistance:.2f}" if nearest_resistance is not None else "Above breakout", "breakout_zone")
         add_candidate("buy", "failed_breakdown_buy", detect_liquidity_sweep_reversal("buy", nearest_support, m5_candles, m1_candles), 75, "Sell-side liquidity was swept and price reclaimed support.", pullback_buy_zone, "support")
-        add_candidate("buy", "breakout_buy", detect_compression_breakout("buy", nearest_resistance, m5_candles), 70, "Compression released into a bullish breakout.", f"Above {nearest_resistance:.2f}" if nearest_resistance is not None else "Compression breakout", "breakout_zone")
         add_candidate("buy", "range_buy", detect_double_level_reaction("buy", nearest_support, m5_candles), 67, "Double-bottom style reclaim formed at support.", pullback_buy_zone, "support")
         add_candidate("buy", "buy_pullback", detect_shallow_pullback_continuation("buy", nearest_support, m5_candles), 71, "Trend stayed firm and resumed after a shallow pullback.", pullback_buy_zone, "support")
         if market_phase == "range":
@@ -1319,11 +1390,10 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
 
     if bias == "bearish":
         add_candidate("sell", "sell_pullback", detect_pullback_continuation("sell", nearest_support, nearest_resistance, m5_candles, m1_candles), 78, "Bearish context, resistance-side rally, and lower timeframe weakness are aligned.", rally_sell_zone, "resistance")
-        add_candidate("sell", "breakdown_sell", detect_breakout_hold("sell", nearest_support, m5_candles, m1_candles), 72, "Bearish breakdown is holding below support.", f"Below {nearest_support:.2f}" if nearest_support is not None else "Breakdown zone", "breakdown_zone")
         add_candidate("sell", "failed_breakout_sell", detect_failed_break("sell", nearest_resistance, m5_candles, m1_candles), 74, "Resistance was swept and rejected with bearish timing.", rally_sell_zone, "resistance")
         add_candidate("sell", "breakdown_sell", detect_retest_hold("sell", nearest_support, m5_candles, m1_candles), 76, "Support broke, retested, and failed from below.", f"Retest around {nearest_support:.2f}" if nearest_support is not None else "Retest zone", "breakdown_zone")
+        add_candidate("sell", "breakdown_sell", detect_strong_breakout_impulse("sell", nearest_support, m5_candles, m1_candles), 72, "Breakdown is expanding with strong follow-through, so immediate continuation entry is acceptable.", f"Below {nearest_support:.2f}" if nearest_support is not None else "Below breakdown", "breakdown_zone")
         add_candidate("sell", "failed_breakout_sell", detect_liquidity_sweep_reversal("sell", nearest_resistance, m5_candles, m1_candles), 75, "Buy-side liquidity was swept and rejected from resistance.", rally_sell_zone, "resistance")
-        add_candidate("sell", "breakdown_sell", detect_compression_breakout("sell", nearest_support, m5_candles), 70, "Compression released into a bearish breakdown.", f"Below {nearest_support:.2f}" if nearest_support is not None else "Compression breakdown", "breakdown_zone")
         add_candidate("sell", "range_sell", detect_double_level_reaction("sell", nearest_resistance, m5_candles), 67, "Double-top style rejection formed at resistance.", rally_sell_zone, "resistance")
         add_candidate("sell", "sell_pullback", detect_shallow_pullback_continuation("sell", nearest_resistance, m5_candles), 71, "Trend stayed weak and resumed after a shallow rally.", rally_sell_zone, "resistance")
         if market_phase == "range":
@@ -2238,11 +2308,20 @@ def get_cooldown_remaining_seconds() -> int:
 
 def maybe_sync_google_sheet_after_close() -> None:
     try:
-        from google_sheet_sync import WEBHOOK_URL, aggregate_rows, push_to_webhook
+        from google_sheet_sync import (
+            WEBHOOK_URL,
+            GOOGLE_SERVICE_ACCOUNT_JSON,
+            GOOGLE_SHEET_ID,
+            aggregate_rows,
+            push_to_google_sheet,
+            push_to_webhook,
+        )
     except Exception:
         return
 
-    if not WEBHOOK_URL:
+    direct_enabled = bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID)
+    webhook_enabled = bool(WEBHOOK_URL)
+    if not direct_enabled and not webhook_enabled:
         return
 
     try:
@@ -2283,12 +2362,14 @@ def maybe_sync_google_sheet_after_close() -> None:
         close_label = str(latest_quantum_close.get("close_time_label", "") or "").strip()
         broker_date = ""
         if close_label:
-            close_dt = datetime.strptime(close_label, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            broker_date = close_dt.astimezone(timezone(DASHBOARD_TIME_OFFSET)).strftime("%Y-%m-%d")
+            broker_date = datetime.strptime(close_label, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
         if broker_date:
             daily_rows = [row for row in daily_rows if row.date_broker == broker_date]
             summary_rows = [row for row in summary_rows if row.level != "DAY" or row.period == broker_date]
-        push_to_webhook(daily_rows, summary_rows, "all")
+        if direct_enabled:
+            push_to_google_sheet(daily_rows, summary_rows, "all")
+        else:
+            push_to_webhook(daily_rows, summary_rows, "all")
         with AUTOTRADE_LOCK:
             AUTOTRADE_STATE["last_sheet_sync_ticket"] = latest_ticket
         append_ai_logic_audit(
@@ -2863,6 +2944,15 @@ def autonomous_ai_worker() -> None:
         time.sleep(max(1.0, seconds_until_next_autonomous_boundary()))
 
 
+def google_sheet_sync_worker() -> None:
+    while True:
+        try:
+            maybe_sync_google_sheet_after_close()
+        except Exception:
+            pass
+        time.sleep(GOOGLE_SHEET_SYNC_INTERVAL_SECONDS)
+
+
 class AppHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -3199,9 +3289,12 @@ class AppHandler(SimpleHTTPRequestHandler):
 def main() -> None:
     autonomous_thread = threading.Thread(target=autonomous_ai_worker, name="autonomous-ai-worker", daemon=True)
     autonomous_thread.start()
+    sheet_sync_thread = threading.Thread(target=google_sheet_sync_worker, name="google-sheet-sync-worker", daemon=True)
+    sheet_sync_thread.start()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
     print(f"Serving Quantum workspace at http://{HOST}:{PORT}")
     print(f"Autonomous AI loop active for {AUTONOMOUS_AI_SYMBOL} every {AUTONOMOUS_AI_INTERVAL_SECONDS // 60} minutes.")
+    print(f"Google Sheets sync worker active every {GOOGLE_SHEET_SYNC_INTERVAL_SECONDS} seconds.")
     print("Keep this terminal window open while using the site.")
     try:
         server.serve_forever()

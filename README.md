@@ -113,10 +113,12 @@ The engine does not enter just because a bias exists. A candidate must also sati
 
 ### Risk logic
 
-- stops are local and structure-based
-- pullback setups use recent local `M5` swing invalidation
-- breakout setups use local breakout invalidation
-- targets are practical and clamped into an intraday-style distance range
+- stops are local and structure-based first, then shaped by setup family
+- pullback setups use a fixed family max stop distance
+- breakout setups use a wider fixed family max stop distance
+- failed-break and range setups use tighter family stop profiles
+- targets are also family-shaped instead of one generic profile
+- practical TP ranges are still intraday-sized, but differ by setup family
 
 ## Autonomous Behavior
 
