@@ -234,40 +234,40 @@ The dashboard uses 3 main sessions:
 
 ## Google Sheets Sync
 
-Quantum includes a lightweight Google Sheets exporter for a single journal-style performance sheet.
+Quantum can publish closed-trade results into Google Sheets directly from Python.
 
 ### Files
 
 - `google_sheet_sync.py`
-  Builds daily and summary rows from local MT5 closed history
+  Reads local MT5 history and writes the yearly calendar view
 - `google_sheets_webhook.gs`
-  Optional Google Apps Script receiver
+  Older optional Apps Script receiver kept in the repo as a fallback path
 
-### Journal structure
+### Current sheet layout
 
-One sheet tab contains rows for:
+The Google Sheet is now calendar-first.
 
-- `YEAR`
-- `MONTH`
-- `WEEK`
-- `DAY`
+- one yearly tab per year, for example:
+  - `2026`
+  - `2027`
+- each yearly tab contains all 12 months stacked vertically
+- each day cell shows:
+  - day number
+  - `P/L`
+  - `T`
+  - `W/L`
 
-Suggested columns:
+Calendar colors:
 
-- `level`
-- `period`
-- `pnl`
-- `trades`
-- `wins`
-- `losses`
-- `win_pct`
-- `log_time_local`
-- `symbol`
-- `magic`
+- green = positive day
+- red = negative day
+- gray = no-trade day
+
+There is also an optional raw tab name, `profit_calendar`, used only as a legacy/utility label if an older summary tab already exists.
 
 ### Local usage
 
-Print rows locally:
+Print aggregated trade rows locally:
 
 ```powershell
 python google_sheet_sync.py
@@ -279,19 +279,24 @@ Print JSON:
 python google_sheet_sync.py --json
 ```
 
-Sync one broker date only:
+Restrict to one broker date:
 
 ```powershell
 python google_sheet_sync.py --date 2026-03-31
 ```
 
-### Push to Google Sheets directly from Python
+### Push directly to Google Sheets
 
 Set:
 
 ```powershell
 $env:GOOGLE_SERVICE_ACCOUNT_JSON='C:\path\to\service-account.json'
 $env:GOOGLE_SHEET_ID='your-google-sheet-id'
+```
+
+Optional legacy tab env:
+
+```powershell
 $env:GOOGLE_SHEET_TAB='profit_calendar'
 ```
 
@@ -303,51 +308,32 @@ Then push:
 python google_sheet_sync.py --push
 ```
 
-### Optional Apps Script webhook path
-
-1. Open your spreadsheet and create a bound Apps Script project.
-2. Paste in `google_sheets_webhook.gs`.
-3. Set:
-   - `JOURNAL_SHEET_NAME`
-   - optional `EXPECTED_SECRET`
-4. Deploy the Apps Script as a web app that accepts `POST`.
-5. Set environment variables locally:
-
-```powershell
-$env:GOOGLE_SHEETS_WEBHOOK_URL='https://script.google.com/macros/s/.../exec'
-$env:GOOGLE_SHEETS_WEBHOOK_SECRET='your-secret-if-used'
-```
-
-6. Push rows:
-
-```powershell
-python google_sheet_sync.py --push
-```
-
-You can push:
-
-- the full journal with `--mode all`
-- daily rows only with `--mode daily`
-- summary rows only with `--mode summary`
-
 ### Automatic sync on trade close
 
-If either direct Sheets credentials or the webhook is set in the server environment, Quantum can also push updates automatically when a new `Quantum Auto` trade closes.
+If direct Google Sheets credentials are available, `server.py` can auto-update the calendar when a new `Quantum Auto` trade closes.
 
 Example:
 
 ```powershell
 $env:GOOGLE_SERVICE_ACCOUNT_JSON='C:\path\to\service-account.json'
 $env:GOOGLE_SHEET_ID='1XDNo6mnh7IAxE7mLpuGpF8jAr-sZ43gL0jiB2c6meIo'
-$env:GOOGLE_SHEET_TAB='profit_calendar'
 python server.py
 ```
 
 When a new auto trade closes, the server will:
 
-- detect the position lifecycle change
-- find the newest closed `Quantum Auto` ticket
-- upsert the relevant `YEAR / MONTH / WEEK / DAY` rows in the journal sheet
+- detect the open -> closed lifecycle transition
+- collect the latest local MT5 closed history
+- refresh the correct yearly calendar tab automatically
+
+### New year behavior
+
+When trades appear in a new year, Quantum automatically creates a new yearly tab.
+
+Example:
+
+- current year trades update `2026`
+- first `2027` trade automatically creates and updates `2027`
 
 ## API Endpoints
 
