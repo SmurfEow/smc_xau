@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import base64
+import uuid
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -20,7 +21,8 @@ HOST = "127.0.0.1"
 PORT = 8090
 ROOT = Path(__file__).resolve().parent
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
-DASHBOARD_TIME_OFFSET = timedelta(hours=-8)
+MARKET_TIMEZONE = timezone.utc
+BROKER_OFFSET_FALLBACK_SECONDS = 3 * 60 * 60
 TIMEFRAME_MAP = {
     "M1": mt5.TIMEFRAME_M1,
     "M5": mt5.TIMEFRAME_M5,
@@ -31,13 +33,18 @@ TIMEFRAME_MAP = {
 }
 FULL_HISTORY_CHUNK = 1000
 RECENT_SYNC_BARS = 8
-AUTOTRADE_MAGIC = 20260324
+AUTOTRADE_MAGIC = int(os.environ.get("AUTOTRADE_MAGIC", "20260324") or 20260324)
 AUTOTRADE_COMMENT = "Quantum Auto"
 AI_REVIEW_LOG_PATH = ROOT / "ai_trade_reviews.json"
 AI_DECISION_LOG_PATH = ROOT / "ai_trade_decisions.json"
 AI_LOGIC_AUDIT_PATH = ROOT / "ai_logic_audit.json"
+SHEET_SYNC_STATE_PATH = ROOT / "google_sheet_sync_state.json"
 SNAPSHOT_DIR = ROOT / "snapshots"
 LATEST_BOARD_IMAGE_PATH = SNAPSHOT_DIR / "latest-board.png"
+MANUAL_NEWS_CALENDAR_PATH = ROOT / "manual_news_calendar.json"
+DEFAULT_NEWS_BLOCK_BEFORE_MINUTES = 20
+DEFAULT_NEWS_BLOCK_AFTER_MINUTES = 20
+MANUAL_NEWS_BLOCK_MINUTES = 45
 AUTOTRADE_STATE = {
     "enabled": False,
     "lot": 0.01,
@@ -49,7 +56,7 @@ AUTOTRADE_STATE = {
     "active_trade": None,
     "last_sheet_sync_ticket": 0,
 }
-AUTOTRADE_LOCK = threading.Lock()
+AUTOTRADE_LOCK = threading.RLock()
 MT5_LOCK = threading.Lock()
 AUTOTRADE_COOLDOWN_SECONDS = 15 * 60
 DEAL_ENTRY_OUT = getattr(mt5, "DEAL_ENTRY_OUT", 1)
@@ -88,14 +95,38 @@ AVAILABLE_SETUP_TYPES = [
     "range_buy",
     "range_sell",
 ]
+HISTORY_ALL_TIME_BASELINE = datetime(2026, 4, 1, tzinfo=MARKET_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def infer_broker_offset_seconds(symbol_hint: str = "XAUUSD.m") -> int:
+    candidate_symbols = [symbol_hint, AUTONOMOUS_AI_SYMBOL, "XAUUSD.m", "XAUUSD"]
+    seen: set[str] = set()
+    for raw_symbol in candidate_symbols:
+        symbol = str(raw_symbol or "").strip()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            continue
+        tick_time = int(getattr(tick, "time", 0) or 0)
+        if tick_time <= 0:
+            continue
+        current_utc = int(datetime.now(timezone.utc).timestamp())
+        offset_seconds = tick_time - current_utc
+        if abs(offset_seconds) > 12 * 60 * 60:
+            continue
+        return int(round(offset_seconds / 3600.0) * 3600)
+    return BROKER_OFFSET_FALLBACK_SECONDS
 
 
 def get_dashboard_now() -> datetime:
-    return datetime.now(LOCAL_TZ) + DASHBOARD_TIME_OFFSET
+    offset_seconds = infer_broker_offset_seconds()
+    return datetime.now(MARKET_TIMEZONE) + timedelta(seconds=offset_seconds)
 
 
 def to_dashboard_time(unix_seconds: int) -> datetime:
-    return datetime.fromtimestamp(int(unix_seconds or 0), LOCAL_TZ) + DASHBOARD_TIME_OFFSET
+    return datetime.fromtimestamp(int(unix_seconds or 0), MARKET_TIMEZONE)
 
 
 def classify_trading_session(dt: datetime | None) -> str:
@@ -113,7 +144,143 @@ def parse_date_input(value: str | None) -> datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
-    return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
+    return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=MARKET_TIMEZONE)
+
+
+def default_manual_news_calendar() -> dict[str, object]:
+    return {
+        "before_minutes": MANUAL_NEWS_BLOCK_MINUTES,
+        "after_minutes": MANUAL_NEWS_BLOCK_MINUTES,
+        "events": [],
+        "updated_at": "",
+    }
+
+
+def _normalize_news_time(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.strptime(text, "%H:%M").strftime("%H:%M")
+    except ValueError:
+        return ""
+
+
+def normalize_manual_news_event(payload: object) -> dict[str, str] | None:
+    if not isinstance(payload, dict):
+        return None
+    date_text = str(payload.get("date", "") or "").strip()
+    title = str(payload.get("title", "") or "").strip()
+    time_text = _normalize_news_time(payload.get("time"))
+    if not date_text or not title or not time_text:
+        return None
+    try:
+        datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    event_id = str(payload.get("id", "") or "").strip() or uuid.uuid4().hex
+    return {
+        "id": event_id,
+        "date": date_text,
+        "time": time_text,
+        "title": title[:120],
+    }
+
+
+def normalize_manual_news_calendar(payload: object) -> dict[str, object]:
+    baseline = default_manual_news_calendar()
+    if not isinstance(payload, dict):
+        return baseline
+    events = []
+    for item in payload.get("events", []) if isinstance(payload.get("events"), list) else []:
+        normalized = normalize_manual_news_event(item)
+        if normalized:
+            events.append(normalized)
+    events.sort(key=lambda item: (item["date"], item["time"], item["title"].lower(), item["id"]))
+    return {
+        "before_minutes": MANUAL_NEWS_BLOCK_MINUTES,
+        "after_minutes": MANUAL_NEWS_BLOCK_MINUTES,
+        "events": events,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def load_manual_news_calendar() -> dict[str, object]:
+    try:
+        raw = MANUAL_NEWS_CALENDAR_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default_manual_news_calendar()
+    except OSError:
+        return default_manual_news_calendar()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return default_manual_news_calendar()
+    return normalize_manual_news_calendar(payload)
+
+
+def save_manual_news_calendar(payload: object) -> dict[str, object]:
+    normalized = normalize_manual_news_calendar(payload)
+    current = get_dashboard_now()
+    existing_calendar = load_manual_news_calendar()
+    existing_ids = {
+        str(item.get("id", "") or "").strip()
+        for item in existing_calendar.get("events", [])
+        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    }
+    normalized["events"] = [
+        item
+        for item in normalized["events"]
+        if parse_manual_news_event_dt(str(item["date"]), str(item["time"])) >= current or str(item.get("id", "") or "").strip() in existing_ids
+    ]
+    MANUAL_NEWS_CALENDAR_PATH.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
+    return normalized
+
+
+def parse_manual_news_event_dt(date_text: str, time_text: str) -> datetime:
+    return datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M").replace(tzinfo=MARKET_TIMEZONE)
+
+
+def build_manual_news_calendar_status(payload: object, now: datetime | None = None) -> dict[str, object]:
+    calendar_state = normalize_manual_news_calendar(payload)
+    current = now or get_dashboard_now()
+    before_minutes = int(calendar_state["before_minutes"] or 0)
+    after_minutes = int(calendar_state["after_minutes"] or 0)
+    active_event = None
+    upcoming_event = None
+    days_with_events = sorted({str(item["date"]) for item in calendar_state["events"]})
+
+    for item in calendar_state["events"]:
+        event_dt = parse_manual_news_event_dt(str(item["date"]), str(item["time"]))
+        block_start = event_dt - timedelta(minutes=before_minutes)
+        block_end = event_dt + timedelta(minutes=after_minutes)
+        event_payload = {
+            **item,
+            "event_at": event_dt.strftime("%Y-%m-%d %H:%M"),
+            "block_start": block_start.strftime("%Y-%m-%d %H:%M"),
+            "block_end": block_end.strftime("%Y-%m-%d %H:%M"),
+            "minutes_until": int((event_dt - current).total_seconds() // 60),
+        }
+        if block_start <= current <= block_end:
+            active_event = event_payload
+            break
+        if current < block_start and upcoming_event is None:
+            upcoming_event = event_payload
+
+    return {
+        "before_minutes": before_minutes,
+        "after_minutes": after_minutes,
+        "events": calendar_state["events"],
+        "days_with_events": days_with_events,
+        "event_count": len(calendar_state["events"]),
+        "updated_at": str(calendar_state.get("updated_at", "") or ""),
+        "broker_now": current.strftime("%Y-%m-%d %H:%M"),
+        "blocked": active_event is not None,
+        "active_event": active_event,
+        "upcoming_event": upcoming_event,
+    }
+
+
 
 
 def resolve_history_window(period: str, date_from: str | None, date_to: str | None) -> tuple[str, datetime | None, datetime | None]:
@@ -149,7 +316,7 @@ def resolve_history_window(period: str, date_from: str | None, date_to: str | No
         end = start.replace(year=start.year + 1)
         return normalized, start, end
     if normalized == "all":
-        return normalized, None, None
+        return normalized, HISTORY_ALL_TIME_BASELINE, None
     raise ValueError("Unsupported history period.")
 
 
@@ -252,6 +419,26 @@ def append_ai_logic_audit(entry: dict[str, object]) -> None:
     rows.append(entry)
     rows = sorted(rows, key=lambda row: str(row.get("logged_at", "")), reverse=True)[:10000]
     AI_LOGIC_AUDIT_PATH.write_text(json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def load_last_sheet_sync_ticket() -> int:
+    if not SHEET_SYNC_STATE_PATH.exists():
+        return 0
+    try:
+        payload = json.loads(SHEET_SYNC_STATE_PATH.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return 0
+    return int(payload.get("last_sheet_sync_ticket", 0) or 0) if isinstance(payload, dict) else 0
+
+
+def save_last_sheet_sync_ticket(ticket: int) -> None:
+    SHEET_SYNC_STATE_PATH.write_text(
+        json.dumps({"last_sheet_sync_ticket": int(ticket or 0)}, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+AUTOTRADE_STATE["last_sheet_sync_ticket"] = load_last_sheet_sync_ticket()
 
 
 def ai_review_map_by_ticket() -> dict[int, dict[str, object]]:
@@ -828,6 +1015,36 @@ def build_zone_text(levels: list[float], entry: float, side: str, atr_value: flo
     return f"{anchor:.2f}-{anchor + width:.2f}"
 
 
+def recent_fresh_structure_level(
+    side: str,
+    m5_candles: list[dict[str, float | int]],
+    current_price: float,
+) -> float | None:
+    if len(m5_candles) < 5:
+        return None
+    recent = m5_candles[-10:]
+    swing_candidates: list[float] = []
+    for idx in range(1, len(recent) - 1):
+        prev_candle = recent[idx - 1]
+        candle = recent[idx]
+        next_candle = recent[idx + 1]
+        low = float(candle["low"])
+        high = float(candle["high"])
+        if side == "buy":
+            if low <= float(prev_candle["low"]) and low <= float(next_candle["low"]) and low <= current_price:
+                swing_candidates.append(low)
+        else:
+            if high >= float(prev_candle["high"]) and high >= float(next_candle["high"]) and high >= current_price:
+                swing_candidates.append(high)
+    if swing_candidates:
+        return round(max(swing_candidates), 2) if side == "buy" else round(min(swing_candidates), 2)
+    if side == "buy":
+        below = [float(c["low"]) for c in recent[-6:] if float(c["low"]) <= current_price]
+        return round(max(below), 2) if below else None
+    above = [float(c["high"]) for c in recent[-6:] if float(c["high"]) >= current_price]
+    return round(min(above), 2) if above else None
+
+
 def parse_zone_bounds(zone_text: str) -> tuple[float, float] | None:
     text = str(zone_text or "").strip()
     if "-" not in text:
@@ -970,6 +1187,17 @@ def safe_float(value: object) -> float | None:
         return None
 
 
+def market_is_closed(board: dict[str, object]) -> bool:
+    market = board.get("market") if isinstance(board.get("market"), dict) else {}
+    tick_time = int(market.get("tick_time") or 0)
+    if tick_time <= 0:
+        return True
+    tick_dt = datetime.fromtimestamp(tick_time, timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    stale_seconds = (now_utc - tick_dt).total_seconds()
+    return stale_seconds > 10 * 60
+
+
 def detect_breakout_hold(side: str, level: float | None, m5_candles: list[dict[str, float | int]], m1_candles: list[dict[str, float | int]]) -> dict[str, object]:
     if level is None or len(m5_candles) < 3 or len(m1_candles) < 2:
         return {"passed": False, "detail": "Need clearer breakout hold"}
@@ -1099,8 +1327,10 @@ def detect_strong_breakout_impulse(
             and float(last["close"]) >= float(last["high"]) - max(last_range * 0.35, 1.0)
         )
         follow_through = float(last["close"]) >= float(prev["close"]) - 1.2
+        not_too_stretched = (float(last["close"]) - level) <= max(avg_range * 1.1, 6.0)
+        shallow_retrace = float(last["low"]) >= level - max(avg_range * 0.25, 1.0)
         m1_confirm = float(m1_last["close"]) >= float(m1_last["open"]) and float(m1_last["close"]) >= level
-        passed = broke and expansion and strong_close and follow_through and m1_confirm
+        passed = broke and expansion and strong_close and follow_through and not_too_stretched and shallow_retrace and m1_confirm
         return {"passed": passed, "detail": f"Strong impulse breakout above {level:.2f}" if passed else f"No strong bullish impulse above {level:.2f}"}
     broke = float(prev["close"]) < level and float(last["close"]) < level
     expansion = max(prev_range, last_range) >= avg_range * 1.9
@@ -1109,8 +1339,10 @@ def detect_strong_breakout_impulse(
         and float(last["close"]) <= float(last["low"]) + max(last_range * 0.35, 1.0)
     )
     follow_through = float(last["close"]) <= float(prev["close"]) + 1.2
+    not_too_stretched = (level - float(last["close"])) <= max(avg_range * 1.1, 6.0)
+    shallow_retrace = float(last["high"]) <= level + max(avg_range * 0.25, 1.0)
     m1_confirm = float(m1_last["close"]) <= float(m1_last["open"]) and float(m1_last["close"]) <= level
-    passed = broke and expansion and strong_close and follow_through and m1_confirm
+    passed = broke and expansion and strong_close and follow_through and not_too_stretched and shallow_retrace and m1_confirm
     return {"passed": passed, "detail": f"Strong impulse breakdown below {level:.2f}" if passed else f"No strong bearish impulse below {level:.2f}"}
 
 
@@ -1235,6 +1467,28 @@ def build_trade_payload(
 def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
     market = board.get("market") if isinstance(board.get("market"), dict) else {}
     current_price = float(market.get("last_price") or latest_close(get_frame(board, "M5")) or 0.0)
+    if market_is_closed(board):
+        return build_trade_payload(
+            board=board,
+            side="buy",
+            market_phase="closed",
+            bias="inactive",
+            setup_type="none",
+            location="closed",
+            zone_text="Market closed",
+            reason="Market is closed, so no live trade zone or trigger can form right now.",
+            why=["Latest market tick is stale", "Market appears inactive / closed"],
+            conflicts=["Market is closed"],
+            trigger_text="Market closed",
+            execution_plan="Wait for the market to reopen and print fresh ticks before evaluating setups.",
+            entry=None,
+            sl=None,
+            tp1=None,
+            tp2=None,
+            model=CURRENT_STRATEGY_MODEL,
+            pattern_candidates=[],
+            entry_checks={"market_open": False},
+        )
     bias = infer_board_bias(board)
     market_phase = infer_board_phase(board, bias)
     location = infer_setup_location(board)
@@ -1254,8 +1508,10 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
 
     support_candidates = [m5_levels.get("support"), m15_levels.get("support"), m30_levels.get("support"), h1_levels.get("support")]
     resistance_candidates = [m5_levels.get("resistance"), m15_levels.get("resistance"), m30_levels.get("resistance"), h1_levels.get("resistance")]
-    near_support_candidates = [m5_levels.get("support"), m15_levels.get("support")]
-    near_resistance_candidates = [m5_levels.get("resistance"), m15_levels.get("resistance")]
+    fresh_m5_support = recent_fresh_structure_level("buy", m5.get("candles") if isinstance(m5.get("candles"), list) else [], current_price)
+    fresh_m5_resistance = recent_fresh_structure_level("sell", m5.get("candles") if isinstance(m5.get("candles"), list) else [], current_price)
+    near_support_candidates = [fresh_m5_support, m5_levels.get("support"), m15_levels.get("support")]
+    near_resistance_candidates = [fresh_m5_resistance, m5_levels.get("resistance"), m15_levels.get("resistance")]
     support_zone = [float(value) for value in support_candidates if value is not None]
     resistance_zone = [float(value) for value in resistance_candidates if value is not None]
     near_support_zone = [float(value) for value in near_support_candidates if value is not None]
@@ -1547,13 +1803,17 @@ def model_safe_token(model: str) -> str:
     return trimmed or "model"
 
 
-def http_json(url: str, method: str = "GET", payload: dict[str, object] | None = None, timeout: int = OLLAMA_TIMEOUT_SECONDS) -> dict[str, object]:
+def http_json(url: str, method: str = "GET", payload: dict[str, object] | None = None, timeout: int = OLLAMA_TIMEOUT_SECONDS) -> object:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(
         url,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 QuantumBot/1.0",
+        },
     )
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -1568,8 +1828,6 @@ def http_json(url: str, method: str = "GET", payload: dict[str, object] | None =
         parsed = json.loads(body or "{}")
     except json.JSONDecodeError as error:
         raise RuntimeError("Upstream service returned invalid JSON.") from error
-    if not isinstance(parsed, dict):
-        raise RuntimeError("Upstream service returned an unexpected payload.")
     return parsed
 
 
@@ -1734,6 +1992,16 @@ def evaluate_autotrade_signal(
             detail = "Auto trade is disabled."
             log_autotrade("autotrade_dispatch", "disabled", detail)
             return HTTPStatus.OK.value, {"status": "disabled", "detail": detail}
+        news_calendar_status = build_manual_news_calendar_status(load_manual_news_calendar())
+        if bool(news_calendar_status.get("blocked")):
+            active_event = news_calendar_status.get("active_event") if isinstance(news_calendar_status.get("active_event"), dict) else {}
+            detail = f"Manual news block active for {str(active_event.get('title', 'scheduled event') or 'scheduled event')}."
+            log_autotrade("autotrade_dispatch", "news_block", detail, news_event=active_event)
+            return HTTPStatus.OK.value, {
+                "status": "news_block",
+                "detail": detail,
+                "news_calendar": news_calendar_status,
+            }
         now = time.time()
         if signal_id and signal_id == AUTOTRADE_STATE["last_signal_id"]:
             detail = "Signal already processed."
@@ -2339,45 +2607,43 @@ def maybe_sync_google_sheet_after_close() -> None:
         return
 
     deals = history.get("deals", [])
-    latest_quantum_close = None
+    latest_closed_deal = None
     for deal in deals:
-        if str(deal.get("trade_source", "") or "") != AUTOTRADE_COMMENT:
-            continue
-        latest_quantum_close = deal
+        latest_closed_deal = deal
         break
 
-    if not latest_quantum_close:
+    if not latest_closed_deal:
         return
 
-    latest_ticket = int(latest_quantum_close.get("ticket", 0) or 0)
+    latest_ticket = int(latest_closed_deal.get("ticket", 0) or 0)
     if latest_ticket <= 0:
         return
 
+    persisted_ticket = load_last_sheet_sync_ticket()
     with AUTOTRADE_LOCK:
-        if int(AUTOTRADE_STATE.get("last_sheet_sync_ticket", 0) or 0) == latest_ticket:
+        remembered_ticket = int(AUTOTRADE_STATE.get("last_sheet_sync_ticket", 0) or 0)
+        if max(remembered_ticket, persisted_ticket) == latest_ticket:
             return
 
     try:
         daily_rows, summary_rows = aggregate_rows(deals)
-        close_label = str(latest_quantum_close.get("close_time_label", "") or "").strip()
+        close_label = str(latest_closed_deal.get("close_time_label", "") or "").strip()
         broker_date = ""
         if close_label:
             broker_date = datetime.strptime(close_label, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
-        if broker_date:
-            daily_rows = [row for row in daily_rows if row.date_broker == broker_date]
-            summary_rows = [row for row in summary_rows if row.level != "DAY" or row.period == broker_date]
         if direct_enabled:
             push_to_google_sheet(daily_rows, summary_rows, "all")
         else:
             push_to_webhook(daily_rows, summary_rows, "all")
         with AUTOTRADE_LOCK:
             AUTOTRADE_STATE["last_sheet_sync_ticket"] = latest_ticket
+        save_last_sheet_sync_ticket(latest_ticket)
         append_ai_logic_audit(
             build_ai_logic_event(
                 "google_sheet_sync",
                 "success",
-                str(latest_quantum_close.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL),
-                detail=f"Synced Google Sheets after closed ticket {latest_ticket}.",
+                str(latest_closed_deal.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL),
+                detail=f"Synced Google Sheets after closed ticket {latest_ticket} for {broker_date or 'latest date'}.",
                 model=CURRENT_STRATEGY_MODEL,
                 ticket=latest_ticket,
             )
@@ -2387,7 +2653,7 @@ def maybe_sync_google_sheet_after_close() -> None:
             build_ai_logic_event(
                 "google_sheet_sync",
                 "error",
-                str(latest_quantum_close.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL),
+                str(latest_closed_deal.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL),
                 detail=f"Google Sheets sync failed for ticket {latest_ticket}: {error}",
                 model=CURRENT_STRATEGY_MODEL,
                 ticket=latest_ticket,
@@ -2396,7 +2662,6 @@ def maybe_sync_google_sheet_after_close() -> None:
 
 
 def sync_autotrade_lifecycle() -> None:
-    should_sync_sheet = False
     with MT5_LOCK:
         if not mt5.initialize():
             raise RuntimeError("Could not connect to MetaTrader 5. Make sure MT5 is open and logged in.")
@@ -2437,13 +2702,10 @@ def sync_autotrade_lifecycle() -> None:
             if was_active and not active and seen_open:
                 AUTOTRADE_STATE["last_trade_at"] = time.time()
                 AUTOTRADE_STATE["trade_seen_open"] = False
-                should_sync_sheet = True
             AUTOTRADE_STATE["trade_active"] = active
             AUTOTRADE_STATE["active_trade"] = active_trade
         finally:
             mt5.shutdown()
-    if should_sync_sheet:
-        maybe_sync_google_sheet_after_close()
 
 
 def fetch_closed_deals_history(period: str = "daily", date_from: str | None = None, date_to: str | None = None) -> dict[str, object]:
@@ -2472,11 +2734,14 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
                     continue
                 sl_value = getattr(order, "sl", None)
                 tp_value = getattr(order, "tp", None)
+                magic_value = int(getattr(order, "magic", 0) or 0)
                 existing = order_meta_by_key.get(order_key) or {}
                 if sl_value not in (None, 0, 0.0):
                     existing["sl"] = float(sl_value)
                 if tp_value not in (None, 0, 0.0):
                     existing["tp"] = float(tp_value)
+                if magic_value:
+                    existing["magic"] = magic_value
                 order_meta_by_key[order_key] = existing
 
             closed_entries = {DEAL_ENTRY_OUT, DEAL_ENTRY_OUT_BY, DEAL_ENTRY_INOUT}
@@ -2484,17 +2749,6 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
             dashboard_now = get_dashboard_now()
             today_start = dashboard_now.replace(hour=0, minute=0, second=0, microsecond=0)
             today_end = today_start + timedelta(days=1)
-
-            total_net = 0.0
-            total_profit = 0.0
-            total_loss = 0.0
-            today_net = 0.0
-            today_profit = 0.0
-            today_loss = 0.0
-            win_count = 0
-            loss_count = 0
-            today_wins = 0
-            today_losses = 0
 
             for deal in deals:
                 entry = int(getattr(deal, "entry", -1))
@@ -2507,6 +2761,7 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
                 deal_type = int(getattr(deal, "type", -1))
                 side = "buy" if deal_type == DEAL_TYPE_BUY else "sell" if deal_type == DEAL_TYPE_SELL else "other"
                 position_id = int(getattr(deal, "position_id", 0) or 0)
+                magic = int(getattr(deal, "magic", 0) or 0)
                 fallback_key = int(getattr(deal, "order", 0) or 0) or int(getattr(deal, "ticket", 0) or 0)
                 group_key = position_id or fallback_key
                 group = grouped.setdefault(
@@ -2530,6 +2785,7 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
                         "swap": 0.0,
                         "fee": 0.0,
                         "net": 0.0,
+                        "magic": magic,
                         "comment": str(getattr(deal, "comment", "") or ""),
                         "open_comment": "",
                         "close_comment": "",
@@ -2543,6 +2799,8 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
                 current_comment = str(getattr(deal, "comment", "") or "")
                 if current_comment:
                     group["comment"] = current_comment
+                if magic:
+                    group["magic"] = magic
                 if getattr(deal, "sl", None) not in (None, 0, 0.0):
                     group["sl"] = float(getattr(deal, "sl"))
                 if getattr(deal, "tp", None) not in (None, 0, 0.0):
@@ -2578,6 +2836,8 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
                     group["sl"] = float(order_meta["sl"])
                 if group["tp"] in (None, 0, 0.0) and order_meta.get("tp") not in (None, 0, 0.0):
                     group["tp"] = float(order_meta["tp"])
+                if int(group["magic"] or 0) == 0 and order_meta.get("magic") not in (None, 0, 0.0):
+                    group["magic"] = int(order_meta["magic"])
 
                 close_timestamp = int(group["close_time"] or 0)
                 close_dt = to_dashboard_time(close_timestamp)
@@ -2609,6 +2869,7 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
                     "swap": round(float(group["swap"]), 2),
                     "fee": round(float(group["fee"]), 2),
                     "net": round(float(group["net"]), 2),
+                    "magic": int(group["magic"] or 0),
                     "change": round(change, 2),
                     "comment": str(group["comment"] or ""),
                     "open_comment": str(group["open_comment"] or ""),
@@ -2643,22 +2904,24 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
                     row["ai_location"] = ""
                 rows.append(row)
 
-                total_net += float(group["net"])
-                if float(group["net"]) >= 0:
-                    total_profit += float(group["net"])
-                    win_count += 1
-                else:
-                    total_loss += float(group["net"])
-                    loss_count += 1
+            rows = [row for row in rows if int(row.get("magic", 0) or 0) == AUTOTRADE_MAGIC]
 
-                if is_today:
-                    today_net += float(group["net"])
-                    if float(group["net"]) >= 0:
-                        today_profit += float(group["net"])
-                        today_wins += 1
-                    else:
-                        today_loss += float(group["net"])
-                        today_losses += 1
+            all_time_rows = [
+                item for item in rows
+                if to_dashboard_time(int(item["close_time"])) >= HISTORY_ALL_TIME_BASELINE
+            ]
+
+            total_net = sum(float(item["net"]) for item in all_time_rows)
+            total_profit = sum(float(item["net"]) for item in all_time_rows if float(item["net"]) >= 0)
+            total_loss = sum(float(item["net"]) for item in all_time_rows if float(item["net"]) < 0)
+            win_count = sum(1 for item in all_time_rows if float(item["net"]) >= 0)
+            loss_count = sum(1 for item in all_time_rows if float(item["net"]) < 0)
+            today_rows = [item for item in all_time_rows if bool(item.get("is_today"))]
+            today_net = sum(float(item["net"]) for item in today_rows)
+            today_profit = sum(float(item["net"]) for item in today_rows if float(item["net"]) >= 0)
+            today_loss = sum(float(item["net"]) for item in today_rows if float(item["net"]) < 0)
+            today_wins = sum(1 for item in today_rows if float(item["net"]) >= 0)
+            today_losses = sum(1 for item in today_rows if float(item["net"]) < 0)
 
             filtered_rows = [
                 row for row in rows
@@ -2821,7 +3084,7 @@ def fetch_closed_deals_history(period: str = "daily", date_from: str | None = No
             ai_analytics = build_ai_decision_analytics(filtered_ai_decisions, executed_ai_rows)
 
             return {
-                "timezone": "Local - 8h",
+                "timezone": "MT5 Broker Time",
                 "period": selected_period,
                 "date_from": window_start.strftime("%Y-%m-%d") if window_start else None,
                 "date_to": (window_end - timedelta(days=1)).strftime("%Y-%m-%d") if window_start and window_end and selected_period != "custom" else (window_end.strftime("%Y-%m-%d") if window_end and selected_period == "custom" else None),
@@ -3229,14 +3492,16 @@ class AppHandler(SimpleHTTPRequestHandler):
                 "active_trade": AUTOTRADE_STATE["active_trade"],
                 "cooldown_remaining_seconds": get_cooldown_remaining_seconds(),
                 "cooldown_seconds": AUTOTRADE_COOLDOWN_SECONDS,
+                "news_calendar": build_manual_news_calendar_status(load_manual_news_calendar()),
             }
         self.respond_json(HTTPStatus.OK, payload)
 
     def handle_autotrade_config(self) -> None:
         try:
             payload = self.read_json_body()
-            enabled = bool(payload.get("enabled", False))
-            lot = max(0.01, float(payload.get("lot", 0.01) or 0.01))
+            enabled = bool(payload.get("enabled", AUTOTRADE_STATE.get("enabled", False)))
+            lot = max(0.01, float(payload.get("lot", AUTOTRADE_STATE.get("lot", 0.01)) or 0.01))
+            news_calendar_payload = payload.get("news_calendar")
         except (ValueError, TypeError):
             self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Auto trade config requires valid enabled and lot values."})
             return
@@ -3244,10 +3509,15 @@ class AppHandler(SimpleHTTPRequestHandler):
         with AUTOTRADE_LOCK:
             AUTOTRADE_STATE["enabled"] = enabled
             AUTOTRADE_STATE["lot"] = lot
+            if news_calendar_payload is not None:
+                news_calendar_state = save_manual_news_calendar(news_calendar_payload)
+            else:
+                news_calendar_state = load_manual_news_calendar()
             response = {
                 "enabled": AUTOTRADE_STATE["enabled"],
                 "lot": AUTOTRADE_STATE["lot"],
                 "one_trade_only": True,
+                "news_calendar": build_manual_news_calendar_status(news_calendar_state),
             }
         self.respond_json(HTTPStatus.OK, response)
 

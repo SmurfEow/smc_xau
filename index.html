@@ -109,6 +109,64 @@
             </div>
           </div>
         </section>
+        <section id="news-calendar-panel" class="news-calendar-panel glass">
+          <div class="news-calendar-header">
+            <div class="news-calendar-header-copy">
+              <p class="eyebrow">Manual News Block</p>
+              <h2>News Block Calendar</h2>
+            </div>
+            <div class="news-calendar-header-actions">
+              <div class="news-calendar-status-pill">
+                <span class="news-calendar-status-label">Status</span>
+                <div class="news-calendar-status">
+                  <span id="news-calendar-status">No scheduled block.</span>
+                  <strong id="news-calendar-broker-now">Broker Time --</strong>
+                </div>
+              </div>
+              <button id="news-calendar-toggle" class="collapse-button" type="button" aria-expanded="true">-</button>
+            </div>
+          </div>
+          <div class="news-calendar-body">
+            <div class="news-calendar-surface">
+              <div class="news-calendar-toolbar">
+                <button id="news-calendar-prev" class="action-button" type="button">Previous</button>
+                <strong id="news-calendar-month-label">--</strong>
+                <button id="news-calendar-next" class="action-button" type="button">Next</button>
+              </div>
+              <div id="news-calendar-grid" class="news-calendar-grid"></div>
+            </div>
+            <div class="news-calendar-editor">
+              <div class="news-calendar-editor-copy">
+                <h3 id="news-calendar-selected-label">Select a day</h3>
+                <p id="news-calendar-selected-copy">Click a broker-time date, add the event time and title, then apply it so the bot blocks that window.</p>
+              </div>
+              <div class="news-calendar-lockline">
+                <span>Hard Block Window</span>
+                <strong>45 min before and 45 min after every saved event</strong>
+              </div>
+              <div class="news-calendar-settings">
+                <label class="news-calendar-field">
+                  <span>Event Time</span>
+                  <input id="news-event-time" type="time" />
+                </label>
+                <label class="news-calendar-field news-calendar-field-wide">
+                  <span>Event Title</span>
+                  <input id="news-event-title" type="text" placeholder="FOMC, CPI, NFP..." spellcheck="false" />
+                </label>
+              </div>
+              <div class="news-calendar-editor-actions">
+                <button id="news-event-add" class="action-button primary" type="button">Add Event</button>
+                <button id="news-event-cancel" class="action-button" type="button">Cancel Edit</button>
+                <button id="news-calendar-apply" class="action-button" type="button">Apply Calendar</button>
+              </div>
+              <div class="news-calendar-editor-copy">
+                <h3>Selected Day Events</h3>
+                <p id="news-calendar-event-copy">No events on this date yet.</p>
+              </div>
+              <div id="news-calendar-event-list" class="news-calendar-event-list"></div>
+            </div>
+          </div>
+        </section>
         <section id="ai-brief-panel" class="ai-brief-panel glass">
           <div class="ai-brief-header">
             <div>
@@ -136,6 +194,6 @@
       </section>
     </div>
 
-    <script src="app.js?v=20260330b"></script>
+    <script src="app.js?v=20260408c"></script>
   </body>
 </html>

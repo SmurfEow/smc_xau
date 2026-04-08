@@ -54,6 +54,23 @@ const activeTradeVolume = document.getElementById("active-trade-volume");
 const activeTradePrice = document.getElementById("active-trade-price");
 const activeTradeSl = document.getElementById("active-trade-sl");
 const activeTradeTp = document.getElementById("active-trade-tp");
+const newsCalendarStatus = document.getElementById("news-calendar-status");
+const newsCalendarBrokerNow = document.getElementById("news-calendar-broker-now");
+const newsCalendarPanelElement = document.getElementById("news-calendar-panel");
+const newsCalendarToggle = document.getElementById("news-calendar-toggle");
+const newsCalendarMonthLabel = document.getElementById("news-calendar-month-label");
+const newsCalendarGrid = document.getElementById("news-calendar-grid");
+const newsCalendarPrevButton = document.getElementById("news-calendar-prev");
+const newsCalendarNextButton = document.getElementById("news-calendar-next");
+const newsCalendarSelectedLabel = document.getElementById("news-calendar-selected-label");
+const newsCalendarSelectedCopy = document.getElementById("news-calendar-selected-copy");
+const newsEventTimeInput = document.getElementById("news-event-time");
+const newsEventTitleInput = document.getElementById("news-event-title");
+const newsEventAddButton = document.getElementById("news-event-add");
+const newsEventCancelButton = document.getElementById("news-event-cancel");
+const newsCalendarApplyButton = document.getElementById("news-calendar-apply");
+const newsCalendarEventCopy = document.getElementById("news-calendar-event-copy");
+const newsCalendarEventList = document.getElementById("news-calendar-event-list");
 const aiBriefPanelElement = document.getElementById("ai-brief-panel");
 const aiBriefToggle = document.getElementById("ai-brief-toggle");
 const aiStatusLabel = document.getElementById("ai-status-label");
@@ -97,6 +114,22 @@ let autoTradeConfig = {
 let cooldownRemainingSeconds = 0;
 let tradeActive = false;
 let activeTradeSnapshot = null;
+let newsCalendarState = {
+  before_minutes: 45,
+  after_minutes: 45,
+  events: [],
+  days_with_events: [],
+  event_count: 0,
+  blocked: false,
+  active_event: null,
+  upcoming_event: null,
+  broker_now: "",
+  updated_at: "",
+  selectedDate: "",
+  viewMonth: "",
+  editingEventId: "",
+  hasUnsavedChanges: false,
+};
 let aiBriefState = {
   available: false,
   inFlight: false,
@@ -119,6 +152,95 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+function monthKeyFromDate(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}`;
+}
+
+function dateKeyFromDate(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function parseBrokerDateTime(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const normalized = text.length === 16 ? `${text}:00` : text;
+  const date = new Date(normalized.replace(" ", "T"));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatMonthLabel(monthKey) {
+  if (!monthKey) return "--";
+  const [year, month] = String(monthKey).split("-").map(Number);
+  const date = new Date(year, (month || 1) - 1, 1);
+  return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function formatSelectedDateLabel(dateKey) {
+  if (!dateKey) return "Select a day";
+  const [year, month, day] = String(dateKey).split("-").map(Number);
+  const date = new Date(year, (month || 1) - 1, day || 1);
+  return date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+}
+
+function getBrokerNowDate() {
+  const parsed = parseBrokerDateTime(newsCalendarState.broker_now);
+  return parsed || new Date();
+}
+
+function parseNewsEventDateTime(dateKey, timeValue = "00:00") {
+  const text = `${String(dateKey || "").trim()} ${String(timeValue || "00:00").trim()}`.trim();
+  return parseBrokerDateTime(text);
+}
+
+function isPastNewsDate(dateKey) {
+  const selected = parseNewsEventDateTime(dateKey, "00:00");
+  const brokerNow = getBrokerNowDate();
+  if (!selected) return false;
+  return selected.getTime() < new Date(brokerNow.getFullYear(), brokerNow.getMonth(), brokerNow.getDate()).getTime();
+}
+
+function isPastNewsEvent(dateKey, timeValue) {
+  const eventDate = parseNewsEventDateTime(dateKey, timeValue);
+  const brokerNow = getBrokerNowDate();
+  if (!eventDate) return false;
+  return eventDate.getTime() < brokerNow.getTime();
+}
+
+function normalizeNewsCalendarPayload(payload) {
+  const fallbackDate = dateKeyFromDate(getBrokerNowDate());
+  const events = Array.isArray(payload?.events)
+    ? payload.events
+        .map((item) => ({
+          id: String(item?.id || `${item?.date || fallbackDate}-${item?.time || "00:00"}-${Math.random().toString(36).slice(2, 8)}`),
+          date: String(item?.date || "").trim(),
+          time: String(item?.time || "").trim(),
+          title: String(item?.title || "").trim(),
+        }))
+        .filter((item) => item.date && item.time && item.title)
+        .sort((a, b) => `${a.date} ${a.time} ${a.title}`.localeCompare(`${b.date} ${b.time} ${b.title}`))
+    : [];
+  const selectedDate = newsCalendarState.selectedDate || payload?.selectedDate || (events[0]?.date || fallbackDate);
+  const viewMonth = newsCalendarState.viewMonth || payload?.viewMonth || selectedDate.slice(0, 7);
+  return {
+    before_minutes: 45,
+    after_minutes: 45,
+    events,
+    days_with_events: Array.isArray(payload?.days_with_events) ? payload.days_with_events.map((item) => String(item || "").trim()).filter(Boolean) : [],
+    event_count: Number(payload?.event_count || events.length),
+    blocked: Boolean(payload?.blocked),
+    active_event: payload?.active_event || null,
+    upcoming_event: payload?.upcoming_event || null,
+    broker_now: String(payload?.broker_now || ""),
+    updated_at: String(payload?.updated_at || ""),
+    selectedDate,
+    viewMonth,
+  };
 }
 
 function readWorkspaceSession() {
@@ -159,6 +281,7 @@ function buildWorkspaceSessionSnapshot() {
     limit: String(limitInput?.value || "ALL").trim().toUpperCase() || "ALL",
     autoRefreshEnabled: Boolean(autoRefreshEnabled),
     autotradeCollapsed: Boolean(autotradePanelElement?.classList.contains("is-collapsed")),
+    newsCalendarCollapsed: Boolean(newsCalendarPanelElement?.classList.contains("is-collapsed")),
     aiCollapsed: Boolean(aiBriefPanelElement?.classList.contains("is-collapsed")),
     aiReview: aiBriefState.review || null,
     aiMeta: String(aiBriefMeta?.textContent || "").trim(),
@@ -212,6 +335,7 @@ function restoreWorkspaceSessionState() {
   }
 
   setCollapsedState(autotradePanelElement, false, autotradePanelToggle);
+  setCollapsedState(newsCalendarPanelElement, false, newsCalendarToggle);
   setCollapsedState(aiBriefPanelElement, false, aiBriefToggle);
 
   if (snapshot.aiReview && typeof snapshot.aiReview === "object") {
@@ -1663,6 +1787,160 @@ function renderChecks(container, groupedChecks) {
   }
 }
 
+function buildNewsEventsByDate() {
+  const grouped = new Map();
+  for (const event of newsCalendarState.events || []) {
+    const bucket = grouped.get(event.date) || [];
+    bucket.push(event);
+    grouped.set(event.date, bucket);
+  }
+  for (const bucket of grouped.values()) {
+    bucket.sort((a, b) => `${a.time} ${a.title}`.localeCompare(`${b.time} ${b.title}`));
+  }
+  return grouped;
+}
+
+function renderNewsCalendarDayEditor() {
+  if (!newsCalendarSelectedLabel || !newsCalendarSelectedCopy || !newsCalendarEventCopy || !newsCalendarEventList) return;
+  const selectedDate = newsCalendarState.selectedDate || dateKeyFromDate(getBrokerNowDate());
+  const eventsByDate = buildNewsEventsByDate();
+  const events = eventsByDate.get(selectedDate) || [];
+  const selectedDateIsPast = isPastNewsDate(selectedDate);
+  newsCalendarSelectedLabel.textContent = formatSelectedDateLabel(selectedDate);
+  newsCalendarSelectedCopy.textContent = selectedDateIsPast
+    ? "This broker-time date has already passed. You can review old items here, but you cannot add a new event to this day."
+    : "Events use broker time. Every saved event hard-blocks the bot for 45 min before and 45 min after.";
+  const editingEvent = (newsCalendarState.events || []).find((event) => event.id === newsCalendarState.editingEventId) || null;
+  if (newsEventAddButton) newsEventAddButton.textContent = editingEvent ? "Update Event" : "Add Event";
+  if (newsEventCancelButton) newsEventCancelButton.style.display = editingEvent ? "" : "none";
+  if (newsEventTimeInput) newsEventTimeInput.disabled = selectedDateIsPast;
+  if (newsEventTitleInput) newsEventTitleInput.disabled = selectedDateIsPast;
+  if (newsEventAddButton) newsEventAddButton.disabled = selectedDateIsPast;
+  newsCalendarEventCopy.textContent = events.length ? `${events.length} event${events.length === 1 ? "" : "s"} on this date.` : "No events on this date yet.";
+  newsCalendarEventList.innerHTML = "";
+  if (!events.length) {
+    newsCalendarEventList.innerHTML = `<div class="news-calendar-event-card"><div class="news-calendar-event-meta"><strong>No events</strong><span>Add a broker-time entry for CPI, FOMC, NFP, or any manual block.</span></div></div>`;
+    newsCalendarEventList.innerHTML += `<p class="news-calendar-empty-hint">Edit and Remove buttons appear here after you add an event.</p>`;
+    return;
+  }
+  for (const event of events) {
+    const eventIsPast = isPastNewsEvent(event.date, event.time);
+    const row = document.createElement("div");
+    row.className = "news-calendar-event-card";
+    row.innerHTML = `
+      <div class="news-calendar-event-meta">
+        <strong>${escapeHtml(event.title)}</strong>
+        <span>${escapeHtml(event.date)} | ${escapeHtml(event.time)}${eventIsPast ? " | Passed" : ""}</span>
+      </div>
+      <div class="news-calendar-event-actions">
+        <button class="action-button" type="button" data-edit-event-id="${escapeHtml(event.id)}" ${eventIsPast ? "disabled" : ""}>Edit</button>
+        <button class="action-button news-calendar-remove" type="button" data-event-id="${escapeHtml(event.id)}">Remove</button>
+      </div>
+    `;
+    newsCalendarEventList.appendChild(row);
+  }
+}
+
+function renderNewsCalendarGrid() {
+  if (!newsCalendarGrid || !newsCalendarMonthLabel) return;
+  const viewMonth = newsCalendarState.viewMonth || monthKeyFromDate(getBrokerNowDate());
+  const [year, month] = viewMonth.split("-").map(Number);
+  const monthStart = new Date(year, (month || 1) - 1, 1);
+  const startDay = monthStart.getDay();
+  const gridStart = new Date(year, (month || 1) - 1, 1 - startDay);
+  const eventsByDate = buildNewsEventsByDate();
+  const activeDate = newsCalendarState.active_event?.date || "";
+  const appliedDates = new Set(Array.isArray(newsCalendarState.days_with_events) ? newsCalendarState.days_with_events : []);
+  newsCalendarMonthLabel.textContent = formatMonthLabel(viewMonth);
+  newsCalendarGrid.innerHTML = "";
+  for (const label of ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]) {
+    const head = document.createElement("div");
+    head.className = "news-calendar-weekday";
+    head.textContent = label;
+    newsCalendarGrid.appendChild(head);
+  }
+  for (let index = 0; index < 42; index += 1) {
+    const day = new Date(gridStart);
+    day.setDate(gridStart.getDate() + index);
+    const dateKey = dateKeyFromDate(day);
+    const monthKey = monthKeyFromDate(day);
+    const events = eventsByDate.get(dateKey) || [];
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "news-calendar-day";
+    if (monthKey !== viewMonth) cell.classList.add("is-muted");
+    if (events.length) cell.classList.add("is-has-events");
+    if (appliedDates.has(dateKey)) cell.classList.add("is-applied");
+    if (dateKey === newsCalendarState.selectedDate) cell.classList.add("is-selected");
+    if (dateKey === activeDate) cell.classList.add("is-active-block");
+    if (isPastNewsDate(dateKey)) cell.classList.add("is-past");
+    const preview = events.slice(0, 2).map((event) => `<div class="news-calendar-day-item">${escapeHtml(event.time)} ${escapeHtml(event.title)}</div>`).join("");
+    cell.innerHTML = `
+      <div class="news-calendar-day-top">
+        <strong class="news-calendar-day-number">${day.getDate()}</strong>
+        <span class="news-calendar-day-count">${events.length ? `${events.length} item${events.length === 1 ? "" : "s"}` : ""}</span>
+      </div>
+      <div class="news-calendar-day-items">${preview}</div>
+    `;
+    cell.dataset.date = dateKey;
+    newsCalendarGrid.appendChild(cell);
+  }
+}
+
+function renderNewsCalendarPanel() {
+  if (newsCalendarStatus) {
+    if (newsCalendarState.blocked && newsCalendarState.active_event) {
+      newsCalendarStatus.textContent = `Blocking now for ${newsCalendarState.active_event.title} until ${newsCalendarState.active_event.block_end}.`;
+    } else if (newsCalendarState.upcoming_event) {
+      newsCalendarStatus.textContent = `Next block starts with ${newsCalendarState.upcoming_event.title} at ${newsCalendarState.upcoming_event.event_at}.`;
+    } else if ((newsCalendarState.event_count || 0) > 0) {
+      newsCalendarStatus.textContent = `${newsCalendarState.event_count} saved event${newsCalendarState.event_count === 1 ? "" : "s"} in the calendar.`;
+    } else {
+      newsCalendarStatus.textContent = "No saved news block yet.";
+    }
+  }
+  if (newsCalendarBrokerNow) {
+    newsCalendarBrokerNow.textContent = newsCalendarState.broker_now ? `Broker Time ${newsCalendarState.broker_now}` : "Broker Time --";
+  }
+  renderNewsCalendarGrid();
+  renderNewsCalendarDayEditor();
+}
+
+function updateNewsCalendarState(payload) {
+  const nextState = normalizeNewsCalendarPayload(payload);
+  const preserveLocalDraft = Boolean(newsCalendarState.hasUnsavedChanges);
+  newsCalendarState = {
+    ...newsCalendarState,
+    ...nextState,
+    events: preserveLocalDraft ? newsCalendarState.events : nextState.events,
+    event_count: preserveLocalDraft ? Number(newsCalendarState.events?.length || 0) : nextState.event_count,
+    days_with_events: preserveLocalDraft ? newsCalendarState.days_with_events : nextState.days_with_events,
+    updated_at: preserveLocalDraft ? newsCalendarState.updated_at : nextState.updated_at,
+    selectedDate: newsCalendarState.selectedDate || nextState.selectedDate,
+    viewMonth: newsCalendarState.viewMonth || nextState.viewMonth,
+  };
+  if (!newsCalendarState.selectedDate) newsCalendarState.selectedDate = nextState.selectedDate;
+  if (!newsCalendarState.viewMonth) newsCalendarState.viewMonth = nextState.viewMonth;
+  renderNewsCalendarPanel();
+}
+
+function clearNewsCalendarEditor() {
+  newsCalendarState.editingEventId = "";
+  if (newsEventTimeInput) newsEventTimeInput.value = "";
+  if (newsEventTitleInput) newsEventTitleInput.value = "";
+}
+
+function startEditingNewsCalendarEvent(eventId) {
+  const event = (newsCalendarState.events || []).find((item) => item.id === eventId);
+  if (!event) return;
+  newsCalendarState.editingEventId = event.id;
+  newsCalendarState.selectedDate = event.date;
+  newsCalendarState.viewMonth = String(event.date || "").slice(0, 7) || newsCalendarState.viewMonth;
+  if (newsEventTimeInput) newsEventTimeInput.value = event.time || "";
+  if (newsEventTitleInput) newsEventTitleInput.value = event.title || "";
+  renderNewsCalendarPanel();
+}
+
 function setAutoTradeUi() {
   if (autotradeStatusLabel) {
     autotradeStatusLabel.textContent = autoTradeConfig.enabled ? "On" : "Off";
@@ -1685,6 +1963,7 @@ async function loadAutoTradeStatus() {
     tradeActive = Boolean(payload.trade_active);
     activeTradeSnapshot = payload.active_trade || null;
     cooldownRemainingSeconds = Number(payload.cooldown_remaining_seconds || 0);
+    updateNewsCalendarState(payload.news_calendar || {});
     setAutoTradeUi();
     renderCooldownLabel();
     renderActiveTradePanel();
@@ -1702,12 +1981,19 @@ async function saveAutoTradeConfig() {
     body: JSON.stringify({
       enabled: autoTradeConfig.enabled,
       lot: nextLot,
+      news_calendar: {
+        before_minutes: 45,
+        after_minutes: 45,
+        events: Array.isArray(newsCalendarState.events) ? newsCalendarState.events : [],
+      },
     }),
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.detail || "Failed to save auto trade config.");
   autoTradeConfig.enabled = Boolean(payload.enabled);
   autoTradeConfig.lot = Number(payload.lot || nextLot);
+  newsCalendarState.hasUnsavedChanges = false;
+  updateNewsCalendarState(payload.news_calendar || {});
   setAutoTradeUi();
 }
 
@@ -2629,6 +2915,52 @@ function renderSingleChart(timeframe) {
   drawChart(timeframe);
 }
 
+function shiftNewsCalendarMonth(delta) {
+  const viewMonth = newsCalendarState.viewMonth || monthKeyFromDate(getBrokerNowDate());
+  const [year, month] = viewMonth.split("-").map(Number);
+  const next = new Date(year, (month || 1) - 1 + delta, 1);
+  newsCalendarState.viewMonth = monthKeyFromDate(next);
+  renderNewsCalendarPanel();
+}
+
+function selectNewsCalendarDate(dateKey) {
+  newsCalendarState.selectedDate = dateKey;
+  newsCalendarState.viewMonth = String(dateKey || "").slice(0, 7) || newsCalendarState.viewMonth;
+  renderNewsCalendarPanel();
+}
+
+function addNewsCalendarEvent() {
+  const selectedDate = newsCalendarState.selectedDate || dateKeyFromDate(getBrokerNowDate());
+  const timeValue = String(newsEventTimeInput?.value || "").trim();
+  const titleValue = String(newsEventTitleInput?.value || "").trim();
+  if (!selectedDate || !timeValue || !titleValue) return;
+  if (isPastNewsEvent(selectedDate, timeValue)) {
+    bridgeStatus.textContent = "Past broker-time events cannot be added";
+    return;
+  }
+  const editingId = newsCalendarState.editingEventId || "";
+  const nextEvent = {
+    id: editingId || `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    date: selectedDate,
+    time: timeValue,
+    title: titleValue,
+  };
+  const existingEvents = (newsCalendarState.events || []).filter((event) => event.id !== editingId);
+  newsCalendarState.events = [...existingEvents, nextEvent].sort((a, b) => `${a.date} ${a.time} ${a.title}`.localeCompare(`${b.date} ${b.time} ${b.title}`));
+  newsCalendarState.event_count = newsCalendarState.events.length;
+  newsCalendarState.hasUnsavedChanges = true;
+  clearNewsCalendarEditor();
+  renderNewsCalendarPanel();
+}
+
+function removeNewsCalendarEvent(eventId) {
+  newsCalendarState.events = (newsCalendarState.events || []).filter((event) => event.id !== eventId);
+  newsCalendarState.event_count = newsCalendarState.events.length;
+  newsCalendarState.hasUnsavedChanges = true;
+  if (newsCalendarState.editingEventId === eventId) clearNewsCalendarEditor();
+  renderNewsCalendarPanel();
+}
+
 function setCollapsedState(target, collapsed, button, expandedLabel = "-", collapsedLabel = "+") {
   if (!target || !button) return;
   target.classList.toggle("is-collapsed", collapsed);
@@ -2645,6 +2977,11 @@ function toggleAutoTradePanelCollapsed() {
 function toggleAiBriefCollapsed() {
   const collapsed = !aiBriefPanelElement?.classList.contains("is-collapsed");
   setCollapsedState(aiBriefPanelElement, collapsed, aiBriefToggle);
+}
+
+function toggleNewsCalendarCollapsed() {
+  const collapsed = !newsCalendarPanelElement?.classList.contains("is-collapsed");
+  setCollapsedState(newsCalendarPanelElement, collapsed, newsCalendarToggle);
 }
 
 function toggleChartCollapsed(timeframe) {
@@ -2757,6 +3094,7 @@ toggleMotionButton?.addEventListener("click", (event) => {
   startAiBriefAutoRefresh();
 });
 autotradePanelToggle?.addEventListener("click", toggleAutoTradePanelCollapsed);
+newsCalendarToggle?.addEventListener("click", toggleNewsCalendarCollapsed);
 aiBriefToggle?.addEventListener("click", toggleAiBriefCollapsed);
 refreshAiBriefButton?.addEventListener("click", () => {
   requestAiBrief(true);
@@ -2782,6 +3120,46 @@ autotradeLotInput?.addEventListener("change", async () => {
     bridgeStatus.textContent = "Lot save failed";
   }
 });
+newsCalendarPrevButton?.addEventListener("click", () => {
+  shiftNewsCalendarMonth(-1);
+});
+newsCalendarNextButton?.addEventListener("click", () => {
+  shiftNewsCalendarMonth(1);
+});
+newsCalendarGrid?.addEventListener("click", (event) => {
+  const button = event.target instanceof Element ? event.target.closest(".news-calendar-day") : null;
+  if (!button) return;
+  const dateKey = button.getAttribute("data-date");
+  if (dateKey) selectNewsCalendarDate(dateKey);
+});
+newsEventAddButton?.addEventListener("click", () => {
+  addNewsCalendarEvent();
+});
+newsCalendarEventList?.addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  const editButton = target ? target.closest("[data-edit-event-id]") : null;
+  if (editButton) {
+    startEditingNewsCalendarEvent(String(editButton.getAttribute("data-edit-event-id") || ""));
+    return;
+  }
+  const removeButton = target ? target.closest("[data-event-id]") : null;
+  if (!removeButton) return;
+  removeNewsCalendarEvent(String(removeButton.getAttribute("data-event-id") || ""));
+});
+newsEventCancelButton?.addEventListener("click", () => {
+  clearNewsCalendarEditor();
+  renderNewsCalendarPanel();
+});
+newsCalendarApplyButton?.addEventListener("click", async () => {
+  newsCalendarState.before_minutes = 45;
+  newsCalendarState.after_minutes = 45;
+  try {
+    await saveAutoTradeConfig();
+    bridgeStatus.textContent = "Calendar saved";
+  } catch (error) {
+    bridgeStatus.textContent = "Calendar save failed";
+  }
+});
 contentScrollElement?.addEventListener("scroll", () => {
   saveWorkspaceSessionState();
 });
@@ -2795,6 +3173,7 @@ formatClock();
 window.setInterval(formatClock, 1000);
 renderCooldownLabel();
 renderActiveTradePanel();
+renderNewsCalendarPanel();
 startCooldownTicker();
 resizeCanvases();
 renderBoard();

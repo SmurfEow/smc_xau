@@ -19,8 +19,8 @@ LOCAL_HISTORY_URL = os.getenv("QUANTUM_HISTORY_URL", "http://127.0.0.1:8090/api/
 BROKER_OFFSET_HOURS = int(os.getenv("QUANTUM_BROKER_OFFSET_HOURS", "-8"))
 LOG_TIME_LOCAL = os.getenv("QUANTUM_LOG_TIME_LOCAL", "19:30")
 DEFAULT_SYMBOL = os.getenv("QUANTUM_SHEET_SYMBOL", "XAUUSD.m")
-DEFAULT_MAGIC = int(os.getenv("QUANTUM_SHEET_MAGIC", "880005"))
-DEFAULT_SOURCE = os.getenv("QUANTUM_TRADE_SOURCE", "Quantum Auto")
+DEFAULT_MAGIC = int(os.getenv("QUANTUM_SHEET_MAGIC", os.getenv("AUTOTRADE_MAGIC", "20260324")) or 20260324)
+DEFAULT_SOURCE = os.getenv("QUANTUM_TRADE_SOURCE", "").strip()
 WEBHOOK_URL = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("GOOGLE_SHEETS_WEBHOOK_SECRET", "").strip()
 DEFAULT_SERVICE_ACCOUNT_JSON = r"C:\Users\User\Downloads\xauusdregime-bda2270705f3.json"
@@ -91,7 +91,9 @@ def aggregate_rows(
     grouped: dict[str, list[float]] = defaultdict(list)
 
     for deal in deals:
-        if str(deal.get("trade_source", "")) != trade_source:
+        if trade_source and str(deal.get("trade_source", "")) != trade_source:
+            continue
+        if int(deal.get("magic", 0) or 0) != int(magic):
             continue
         close_label = str(deal.get("close_time_label") or "").strip()
         if not close_label:
