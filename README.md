@@ -5,6 +5,7 @@ Quantum is a local MT5 trading workspace for `XAUUSD` with:
 - a live multi-timeframe board in the workspace
 - a server-side autonomous decision loop that evaluates every 5 minutes
 - auto-trade execution with safety checks
+- a manual broker-time news block calendar for CPI, FOMC, NFP, and custom event pauses
 - a dashboard for setup, session, expectancy, and missed-trade analytics
 
 The website is the display and control layer. The server is the engine.
@@ -23,7 +24,7 @@ The website is the display and control layer. The server is the engine.
 ### Live pages
 
 - `index.html`
-  Live workspace and auto-trade control
+  Live workspace, auto-trade control, and manual broker-time news block calendar
 - `dashboard.html`
   Historical and analytical dashboard
 
@@ -64,6 +65,11 @@ Older Ollama/vision experiments are not the live trading path now.
 
 - `snapshots/latest-board.png`
   Latest workspace-rendered board image for manual review or sharing
+
+### Local runtime data
+
+- `manual_news_calendar.json`
+  Saved manual news block events used by the auto-trade guard
 
 ## Trading Method
 
@@ -141,6 +147,16 @@ The trading engine itself does not need the workspace tab open to keep evaluatin
 
 The workspace includes an auto-trade control panel.
 
+### Manual news block
+
+The workspace includes a manual broker-time calendar above the Decision Layer.
+
+- events are entered in MT5 broker time
+- each saved event hard-blocks auto-trade for `45` minutes before and `45` minutes after
+- applied days are highlighted in the calendar
+- past broker-time dates cannot be added as new events
+- saved events can be edited or removed from the selected day panel
+
 ### Auto-trade still validates
 
 Even when the engine returns `buy` or `sell`, the server still checks:
@@ -151,6 +167,7 @@ Even when the engine returns `buy` or `sell`, the server still checks:
 - cooldown
 - whether a trade is already active
 - whether auto-trade is enabled
+- whether a manual news block is active
 
 ## Logging And Analytics
 
@@ -197,6 +214,11 @@ Audit events include:
 ## Dashboard
 
 The dashboard is focused on the current live strategy model only.
+
+### Current history scope
+
+- closed-trade history is filtered to the live bot magic number
+- `All-Time Net` currently starts from `2026-04-01`
 
 ### Current useful panels
 
