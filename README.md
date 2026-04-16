@@ -73,58 +73,111 @@ Older Ollama/vision experiments are not the live trading path now.
 
 ## Trading Method
 
-The system currently uses a local structure-based setup engine.
+The system uses a top-down Smart Money Concepts (SMC) framework. Every trade decision flows through three timeframe layers in order. No layer can be skipped.
 
 ### Timeframe roles
 
-- `H4 + H1`
-  Broad bias
-- `M30 + M15`
-  Location and setup context
-- `M5 + M1`
-  Timing and confirmation
+| Timeframe | Role |
+|-----------|------|
+| `H1` | Sets the directional bias. Must show `Uptrend` or `Downtrend` regime. |
+| `M15` | Defines the watch zone. The OTE Fibonacci range is drawn from the M15 impulse leg. |
+| `M5 / M1` | Provides the entry trigger. A confirmed candle inside the zone on M5 or M1 is required before any order is placed. |
 
-### Supported setup types
+### How a trade forms — step by step
 
-- `buy_pullback`
-- `sell_pullback`
-- `breakout_buy`
-- `breakdown_sell`
-- `failed_breakout_sell`
-- `failed_breakdown_buy`
-- `range_buy`
-- `range_sell`
+**Step 1 — H1 sets the direction**
 
-### Pattern coverage
+The engine reads the H1 `marketState`. If both H1 and M15 agree on direction (`Uptrend` = bullish, `Downtrend` = bearish), the overall bias is set. If they disagree, bias is `mixed` and no zone is surfaced — the engine waits.
 
-The classifier builds and ranks candidates from useful generic pattern families, including:
+**Step 2 — M15 draws the OTE zone**
 
-- pullback continuation
-- breakout hold
-- failed breakout / failed breakdown
-- retest hold / retest fail
-- liquidity sweep reversal
-- compression breakout
-- double reaction behavior
-- shallow pullback continuation
-- range edge reversal
+Once bias is confirmed, the engine measures the most recent M15 impulse leg (swing low to swing high for a bullish leg, or swing high to swing low for a bearish leg) and applies Fibonacci retracement levels to that range:
 
-### Entry rules
+```
+structureLow  = 0%   (base of the impulse)
+fib382        = 38.2%
+equilibrium   = 50%
+fib618        = 61.8%
+fib705        = 70.5%
+fib786        = 78.6%
+structureHigh = 100%  (top of the impulse)
+```
 
-The engine does not enter just because a bias exists. A candidate must also satisfy entry quality checks:
+The **OTE (Optimal Trade Entry) zone** is the 61.8%–78.6% retracement of the impulse:
 
-- price is still inside or close enough to the intended zone
-- lower timeframe confirmation exists on `M5/M1`
-- the actual entry matches the stated setup zone
+- Bullish leg: OTE sits near the low end of the range (price pulled back deep, 21.4%–38.2% from the structureLow). This is where a buy is considered.
+- Bearish leg: OTE sits near the high end of the range (price rallied deep, 61.8%–78.6% from the structureLow). This is where a sell is considered.
 
-### Risk logic
+The watch zone displayed in the SMC panel is always the current OTE range in price terms, e.g. `4801.87–4809.66`.
 
-- stops are local and structure-based first, then shaped by setup family
-- pullback setups use a fixed family max stop distance
-- breakout setups use a wider fixed family max stop distance
-- failed-break and range setups use tighter family stop profiles
-- targets are also family-shaped instead of one generic profile
-- practical TP ranges are still intraday-sized, but differ by setup family
+**Step 3 — M15 OB or FVG confirms the location inside the zone**
+
+Price reaching the OTE zone is not enough on its own. The engine looks for a structural reason to enter inside that zone:
+
+- **Order Block (OB)**: the last bearish candle before a bullish impulse (for buys), or the last bullish candle before a bearish impulse (for sells). The OB body is the precise entry area.
+- **Fair Value Gap (FVG)**: a three-candle imbalance where the first candle's high and the third candle's low do not overlap (for buys), or vice versa (for sells). Price retesting this gap is the entry signal.
+
+M15 OBs and FVGs are searched first. M5 OBs and FVGs are used if no M15 zone is found.
+
+**Step 4 — M5 or M1 prints the confirmation candle**
+
+Even with a valid OTE zone and an OB or FVG, the engine waits for a lower timeframe reaction:
+
+- For buys: a bullish M5 or M1 close above the OB/FVG after touching it
+- For sells: a bearish M5 or M1 close below the OB/FVG after touching it
+
+This confirmation candle is the actual trigger. Without it, the engine outputs `no_trade` and waits.
+
+**Step 5 — Additional trigger types**
+
+Beyond OB and FVG retests, the engine also watches for:
+
+- **Sell-side liquidity sweep and reclaim**: price sweeps a prior swing low (triggering stops), then closes back above it. Treated as a buy signal.
+- **Buy-side liquidity sweep and reject**: price sweeps a prior swing high, then closes back below it. Treated as a sell signal.
+- **Failed breakdown / failed breakout**: price breaks a level but cannot sustain it and reverses back inside. Confirms the original direction.
+- **BOS retest**: after a Break of Structure, price retests the broken level from the new side.
+- **Displacement**: a strong impulsive candle continuing through a broken level without retracement.
+
+**Step 6 — Stop loss placement**
+
+The stop loss is anchored to the OTE zone edge:
+
+- Buy trades: SL is placed just below `oteLow` (the deeper OTE boundary, near the 78.6% retracement)
+- Sell trades: SL is placed just above `oteHigh` (the shallower OTE boundary, near the 61.8% retracement)
+
+The SL distance is clamped between 4.5 and 9.0 points for SMC setups.
+
+**Step 7 — Take profit targeting**
+
+The TP is the nearest Fibonacci level on the correct side of the entry:
+
+- Buy trades: the next fib level above entry, chosen from `[fib382, equilibrium, fib618, fib705, fib786, structureHigh]`
+- Sell trades: the next fib level below entry, chosen from `[fib786, fib705, fib618, equilibrium, fib382, structureLow]`
+
+The TP uses the actual fib price as-is, without imposing a minimum RR floor. If the nearest fib is only a few points away, that is the target — the setup geometry determines the reward, not an artificial multiplier.
+
+### Conditions that block a trade
+
+Even if all five steps above are satisfied, the order will not be placed if:
+
+- Auto-trade is disabled in the workspace panel
+- A manual news block is active (45 min before and after any saved calendar event)
+- A trade is already open
+- The duplicate signal guard detects the same signal within the cooldown window
+- The entry, stop, or target fails the final sanity check
+
+### Example trade scenario
+
+> H1 is in an uptrend. M15 shows a bullish impulse leg from 4750 to 4838. The OTE buy zone is 4800–4810 (61.8%–78.6% retracement from the high). A bullish OB sits at 4803–4807 inside that zone. Price pulls back into the zone and touches the OB. M5 prints a bullish engulfing candle closing above 4807. The engine fires a buy at the M5 close price, sets SL below the OTE low (~4800), and targets equilibrium (4794 + 44 × 0.5 = 4816) as TP1.
+
+### What "No clear zone" means
+
+The SMC panel shows `No clear zone` when:
+
+- H1 and M15 do not both agree on a direction (bias is `mixed`)
+- M15 structure direction is neutral (regime is `Transition` or `Range`)
+
+This most commonly occurs after a large price move that changes the M15 structural regime before a new impulse leg has formed. The correct response is to wait for the new structure to establish and for H1 and M15 to re-align.
 
 ## Autonomous Behavior
 

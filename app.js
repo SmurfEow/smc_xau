@@ -1,6 +1,36 @@
 const TIMEFRAMES = [
   "M1", "M5", "M15", "M30", "H1", "H4",
 ];
+// Per-timeframe default candle counts — each TF gets an amount appropriate to its
+// role in the top-down strategy rather than one flat limit for all.
+//   M1/M5  — entry precision/confirmation: covers the current + last session (~5-20 hrs)
+//   M15/M30 — trade location / structure: covers 2-3 trading days
+//   H1      — trend & weekly bias: covers ~1 trading week (5 sessions)
+//   H4      — phase & directional bias: covers ~3 weeks of structure
+const TIMEFRAME_DEFAULT_BARS = {
+  M1: 300,
+  M5: 250,
+  M15: 160,
+  M30: 120,
+  H1: 100,
+  H4: 80,
+};
+// Per-timeframe overlay config — what each chart should plot beyond candles.
+// Mirrors the strategy's top-down role for each TF.
+const TIMEFRAME_OVERLAYS = {
+  M1:  { emas: [9, 20],      vwap: true,  swings: false },
+  M5:  { emas: [9, 20, 50],  vwap: true,  swings: true  },
+  M15: { emas: [20, 50],     vwap: false, swings: true  },
+  M30: { emas: [20, 50],     vwap: false, swings: true  },
+  H1:  { emas: [50, 200],    vwap: false, swings: true  },
+  H4:  { emas: [50, 200],    vwap: false, swings: true  },
+};
+const EMA_STYLE = {
+  9:   { color: "rgba(251, 191, 36, 0.90)", width: 1.2, label: "E9"   },
+  20:  { color: "rgba(168, 85, 247, 0.90)", width: 1.2, label: "E20"  },
+  50:  { color: "rgba(249, 115, 22, 0.90)", width: 1.4, label: "E50"  },
+  200: { color: "rgba(239, 68,  68, 0.75)", width: 1.8, label: "E200" },
+};
 const MARKET_STATE_WINDOWS = {
   regime: 200,
   trend: 50,
@@ -8,25 +38,24 @@ const MARKET_STATE_WINDOWS = {
   level: 120,
 };
 const DISPLAY_TIME_OFFSET_MS = -(8 * 60 * 60 * 1000);
-const TRADE_SCORE_THRESHOLD = 58;
-const TRADE_SCORE_EDGE = 5;
+const SMC_SETUP_SCORE_THRESHOLD = 60;
 const TIMEFRAME_GROUPS = [
   {
     key: "LTF",
     title: "LTF",
-    copy: "Lower timeframe execution and fast momentum.",
+    copy: "Entry precision — OB/FVG retest and M5/M1 confirmation candle.",
     timeframes: ["M1", "M5"],
   },
   {
     key: "MTF",
     title: "MTF",
-    copy: "Mid timeframe structure and trade decision layer.",
+    copy: "Trade location — order blocks, fair value gaps, and BOS/CHoCH structure.",
     timeframes: ["M15", "M30"],
   },
   {
     key: "HTF",
     title: "HTF",
-    copy: "Higher timeframe context and directional bias.",
+    copy: "Market structure bias — premium/discount zones and institutional order flow.",
     timeframes: ["H1", "H4"],
   },
 ];
@@ -94,6 +123,12 @@ for (const timeframe of TIMEFRAMES) {
     marketState: null,
     indicators: null,
     volatility: null,
+    orderBlocks:  { bullish: [], bearish: [] },
+    fairValueGaps: { bullish: [], bearish: [] },
+    bosChoch:        [],
+    activeStructure: null,
+    emaValues:       {},
+    vwapValues:      [],
   };
 }
 
@@ -368,7 +403,7 @@ function buildBoard() {
     section.innerHTML = `
       <div class="timeframe-group-header">
         <div>
-          <p class="eyebrow">Board Group</p>
+          <p class="eyebrow">SMC Layer</p>
           <h3>${group.title}</h3>
         </div>
         <p class="timeframe-group-copy">${group.copy}</p>
@@ -564,13 +599,17 @@ function formatAxisLabel(currentUnixSeconds, previousUnixSeconds) {
   });
 }
 
-function getChartGeometry(canvas, candleCount) {
+function getChartGeometry(canvas, candleCount, atLiveEdge = false) {
   const width = Number(canvas.style.width.replace("px", "")) || canvas.clientWidth || 720;
   const height = Number(canvas.style.height.replace("px", "")) || canvas.clientHeight || 380;
   const padding = { top: 24, right: 78, bottom: 42, left: 16 };
   const chartWidth = width - padding.left - padding.right;
   const chartHeight = height - padding.top - padding.bottom;
-  const barSpacing = candleCount > 0 ? chartWidth / candleCount : chartWidth;
+  // At the live edge, reserve a fixed pixel margin on the right so fib lines/labels always
+  // have clear space at every zoom level. Fixed pixels = consistent gap regardless of bar width.
+  const RIGHT_RESERVE_PX = atLiveEdge ? 85 : 0;
+  const candleAreaWidth = chartWidth - RIGHT_RESERVE_PX;
+  const barSpacing = candleCount > 0 ? candleAreaWidth / candleCount : candleAreaWidth;
   return { width, height, padding, chartWidth, chartHeight, barSpacing };
 }
 
@@ -776,83 +815,6 @@ function getSwingCandidates(candles, kind, lookback = 80) {
   return [...new Set(swings.map((value) => Number(value.toFixed(2))))];
 }
 
-function clampStopDistance(entry, sl, side, minDistance, maxDistance) {
-  if (!Number.isFinite(entry) || !Number.isFinite(sl)) {
-    return { value: sl, mode: "raw" };
-  }
-  const distance = Math.abs(entry - sl);
-  if (Number.isFinite(minDistance) && distance < minDistance) {
-    return {
-      value: side === "long" ? entry - minDistance : entry + minDistance,
-      mode: "floored",
-    };
-  }
-  if (Number.isFinite(maxDistance) && distance > maxDistance) {
-    return {
-      value: side === "long" ? entry - maxDistance : entry + maxDistance,
-      mode: "capped",
-    };
-  }
-  return { value: sl, mode: "raw" };
-}
-
-function chooseDirectionalAnchor(entry, candidates, side, minGap = 0, maxGap = Infinity) {
-  const directional = [...new Set((candidates || []).filter((value) => Number.isFinite(value)))]
-    .filter((value) => (side === "below" ? value < entry : value > entry))
-    .map((value) => ({
-      value,
-      gap: Math.abs(entry - value),
-    }))
-    .sort((left, right) =>
-      side === "below" ? right.value - left.value : left.value - right.value
-    );
-  return (
-    directional.find((item) => item.gap >= minGap && item.gap <= maxGap)?.value ??
-    directional.find((item) => item.gap >= minGap)?.value ??
-    directional.find((item) => item.gap <= maxGap)?.value ??
-    directional[0]?.value ??
-    null
-  );
-}
-
-function chooseTakeProfit(entry, fullTarget, side, riskSeed, minRewardGap) {
-  if (!Number.isFinite(entry) || !Number.isFinite(fullTarget)) {
-    return { value: null, mode: "missing" };
-  }
-  const direction = side === "long" ? 1 : -1;
-  const fullDistance = Math.abs(fullTarget - entry);
-  const minimumDistance = Math.max(
-    Number.isFinite(minRewardGap) ? minRewardGap : 0,
-    5
-  );
-  const maximumDistance = 15;
-  if (fullDistance < minimumDistance) {
-    return { value: null, mode: "insufficient" };
-  }
-
-  const scaledDistance = Math.min(
-    Math.max(fullDistance * 0.7, minimumDistance),
-    maximumDistance,
-    fullDistance
-  );
-  const scaledTarget = entry + direction * scaledDistance;
-  if (Math.abs(scaledTarget - entry) >= minimumDistance) {
-    if (scaledDistance < fullDistance) {
-      return { value: scaledTarget, mode: "scaled" };
-    }
-    return { value: scaledTarget, mode: "full" };
-  }
-
-  const flooredTarget = entry + direction * minimumDistance;
-  if (
-    (side === "long" && flooredTarget <= fullTarget) ||
-    (side === "short" && flooredTarget >= fullTarget)
-  ) {
-    return { value: flooredTarget, mode: "floored" };
-  }
-
-  return { value: fullTarget, mode: "full" };
-}
 
 function calculateMarketState(candles) {
   if (!candles.length) {
@@ -962,6 +924,329 @@ function calculateATR(candles, period = 14) {
   return atr;
 }
 
+// ---------------------------------------------------------------------------
+// SMC overlay compute helpers (client-side, mirrors server-side Python logic)
+// ---------------------------------------------------------------------------
+
+function computeEMA(candles, period) {
+  if (candles.length < period) return [];
+  const k = 2 / (period + 1);
+  const out = new Array(period - 1).fill(null);
+  let ema = candles.slice(0, period).reduce((s, c) => s + Number(c.close), 0) / period;
+  out.push(ema);
+  for (let i = period; i < candles.length; i++) {
+    ema = Number(candles[i].close) * k + ema * (1 - k);
+    out.push(ema);
+  }
+  return out;
+}
+
+function computeVWAP(candles) {
+  const out = [];
+  let tpv = 0, vol = 0, lastDay = null;
+  for (const c of candles) {
+    const dt = new Date(Number(c.time) * 1000);
+    const day = `${dt.getUTCFullYear()}-${dt.getUTCMonth()}-${dt.getUTCDate()}`;
+    if (day !== lastDay) { tpv = 0; vol = 0; lastDay = day; }
+    const tp = (Number(c.high) + Number(c.low) + Number(c.close)) / 3;
+    const v = Math.max(Number(c.tick_volume || 0), 1);
+    tpv += tp * v; vol += v;
+    out.push(tpv / vol);
+  }
+  return out;
+}
+
+function computeOrderBlocks(candles, side, atrValue) {
+  if (candles.length < 5) return [];
+  const impulseMin = Math.max((atrValue || 6) * 1.5, 4);
+  const window = candles.slice(-Math.min(80, candles.length));
+  const obs = [];
+  for (let i = 1; i < window.length - 2; i++) {
+    const c = window[i];
+    const co = Number(c.open), cc = Number(c.close), ch = Number(c.high), cl = Number(c.low);
+    const next = window.slice(i + 1, i + 4);
+    if (!next.length) continue;
+    if (side === "buy") {
+      if (cc >= co) continue;
+      const impulse = next.some(n => Number(n.close) - Number(n.open) >= impulseMin || Number(n.high) > ch + impulseMin * 0.5);
+      if (!impulse) continue;
+      const mid = (co + cc) / 2;
+      const mitigated = window.slice(i + 1).some(n => Number(n.close) < mid);
+      obs.push({ high: Math.max(co, cc), low: Math.min(co, cc), midpoint: mid, time: Number(c.time), mitigated });
+    } else {
+      if (cc <= co) continue;
+      const impulse = next.some(n => Number(n.open) - Number(n.close) >= impulseMin || Number(n.low) < cl - impulseMin * 0.5);
+      if (!impulse) continue;
+      const mid = (co + cc) / 2;
+      const mitigated = window.slice(i + 1).some(n => Number(n.close) > mid);
+      obs.push({ high: Math.max(co, cc), low: Math.min(co, cc), midpoint: mid, time: Number(c.time), mitigated });
+    }
+  }
+  return obs.filter(ob => !ob.mitigated).reverse().slice(0, 5);
+}
+
+// Returns the canvas X for a given unix timestamp relative to visible candles.
+// If the timestamp predates the visible window the OB/FVG still starts at the
+// left edge (it was created earlier but is still unmitigated/unfilled).
+function timeToX(time, visible, padding, barSpacing) {
+  const t = Number(time);
+  if (!visible.length || t <= Number(visible[0].time)) return padding.left;
+  for (let i = 1; i < visible.length; i++) {
+    if (Number(visible[i].time) >= t) return padding.left + i * barSpacing;
+  }
+  return padding.left + visible.length * barSpacing;
+}
+
+function computeFVGs(candles, side) {
+  if (candles.length < 3) return [];
+  const window = candles.slice(-Math.min(80, candles.length));
+  const fvgs = [];
+  for (let i = 1; i < window.length - 1; i++) {
+    const prev = window[i - 1], mid = window[i], nxt = window[i + 1];
+    if (side === "buy") {
+      const gapLow = Number(prev.high), gapHigh = Number(nxt.low);
+      if (gapHigh - gapLow < 0.5) continue;
+      const gapMid = (gapLow + gapHigh) / 2;
+      const filled = window.slice(i + 2).some(n => Number(n.close) <= gapMid);
+      fvgs.push({ high: gapHigh, low: gapLow, midpoint: gapMid, time: Number(mid.time), filled });
+    } else {
+      const gapHigh = Number(prev.low), gapLow = Number(nxt.high);
+      if (gapHigh - gapLow < 0.5) continue;
+      const gapMid = (gapLow + gapHigh) / 2;
+      const filled = window.slice(i + 2).some(n => Number(n.close) >= gapMid);
+      fvgs.push({ high: gapHigh, low: gapLow, midpoint: gapMid, time: Number(mid.time), filled });
+    }
+  }
+  return fvgs.filter(f => !f.filled).reverse().slice(0, 5);
+}
+
+function computeBOSCHoCH(candles) {
+  if (!Array.isArray(candles) || candles.length < 20) return [];
+
+  const lookback = 10;
+  const window = candles.slice(-Math.min(180, candles.length));
+  const n = window.length;
+  const events = [];
+
+  const getHighestBar = (index, bars = lookback) => {
+    const start = Math.max(0, index - bars + 1);
+    let highestIdx = start;
+    for (let i = start + 1; i <= index; i += 1) {
+      if (Number(window[i].high) >= Number(window[highestIdx].high)) highestIdx = i;
+    }
+
+    let pivotIdx = highestIdx;
+    for (let i = Math.max(start + 1, index - bars + 1); i <= index - 1; i += 1) {
+      if (
+        i + 2 <= index &&
+        Number(window[i].high) > Number(window[i - 1].high) &&
+        Number(window[i].high) > Number(window[i + 1].high) &&
+        Number(window[i].high) >= Number(window[pivotIdx].high)
+      ) {
+        pivotIdx = i;
+      }
+    }
+    return pivotIdx;
+  };
+
+  const getLowestBar = (index, bars = lookback) => {
+    const start = Math.max(0, index - bars + 1);
+    let lowestIdx = start;
+    for (let i = start + 1; i <= index; i += 1) {
+      if (Number(window[i].low) <= Number(window[lowestIdx].low)) lowestIdx = i;
+    }
+
+    let pivotIdx = lowestIdx;
+    for (let i = Math.max(start + 1, index - bars + 1); i <= index - 1; i += 1) {
+      if (
+        i + 2 <= index &&
+        Number(window[i].low) < Number(window[i - 1].low) &&
+        Number(window[i].low) < Number(window[i + 1].low) &&
+        Number(window[i].low) <= Number(window[pivotIdx].low)
+      ) {
+        pivotIdx = i;
+      }
+    }
+    return pivotIdx;
+  };
+
+  let structureHighStartIndex = 0;
+  let structureLowStartIndex = 0;
+  let structureHigh = Number(window[0].high);
+  let structureLow = Number(window[0].low);
+  let structureDirection = 0; // 0 neutral, 1 bearish leg, 2 bullish leg
+
+  for (let i = 1; i < n; i += 1) {
+    const bodyBreakHigh = Number(window[i].close);
+    const bodyBreakLow = Number(window[i].close);
+
+    const highBroken =
+      (
+        bodyBreakHigh > structureHigh &&
+        i - 1 > structureHighStartIndex &&
+        Number(window[i - 1]?.close ?? -Infinity) <= structureHigh &&
+        Number(window[i - 2]?.close ?? -Infinity) <= structureHigh &&
+        Number(window[i - 3]?.close ?? -Infinity) <= structureHigh
+      ) ||
+      (structureDirection === 1 && bodyBreakHigh > structureHigh);
+
+    const lowBroken =
+      (
+        bodyBreakLow < structureLow &&
+        i - 1 > structureLowStartIndex &&
+        Number(window[i - 1]?.close ?? Infinity) >= structureLow &&
+        Number(window[i - 2]?.close ?? Infinity) >= structureLow &&
+        Number(window[i - 3]?.close ?? Infinity) >= structureLow
+      ) ||
+      (structureDirection === 2 && bodyBreakLow < structureLow);
+
+    if (lowBroken) {
+      events.push({
+        type: structureDirection === 1 ? "BOS" : "CHoCH",
+        dir: "bear",
+        level: structureLow,
+        levelIdx: structureLowStartIndex,
+        breakIdx: i,
+      });
+
+      const structureMaxBar = getHighestBar(i, lookback);
+      structureDirection = 1;
+      structureHighStartIndex = structureMaxBar;
+      structureLowStartIndex = i;
+      structureHigh = Number(window[structureMaxBar]?.high ?? window[i].high);
+      structureLow = Number(window[i].low);
+      continue;
+    }
+
+    if (highBroken) {
+      events.push({
+        type: structureDirection === 2 ? "BOS" : "CHoCH",
+        dir: "bull",
+        level: structureHigh,
+        levelIdx: structureHighStartIndex,
+        breakIdx: i,
+      });
+
+      const structureMinBar = getLowestBar(i, lookback);
+      structureDirection = 2;
+      structureHighStartIndex = i;
+      structureLowStartIndex = structureMinBar;
+      structureHigh = Number(window[i].high);
+      structureLow = Number(window[structureMinBar]?.low ?? window[i].low);
+      continue;
+    }
+
+    if ((structureDirection === 0 || structureDirection === 2) && Number(window[i].high) > structureHigh) {
+      structureHigh = Number(window[i].high);
+      structureHighStartIndex = i;
+    } else if ((structureDirection === 0 || structureDirection === 1) && Number(window[i].low) < structureLow) {
+      structureLow = Number(window[i].low);
+      structureLowStartIndex = i;
+    }
+  }
+
+  return events.slice(-10);
+}
+
+// Returns the current ACTIVE (unbroken) structure high, low, direction, and their
+// candle indices within the 180-bar window — used to draw the live structure lines
+// and Fibonacci retracement levels on the chart (mirrors the Pine structureHighLine /
+// structureLowLine + Fibonacci drawing logic).
+function computeActiveStructure(candles) {
+  if (!Array.isArray(candles) || candles.length < 10) return null;
+  const lookback = 10;
+  const window = candles.slice(-Math.min(180, candles.length));
+  const n = window.length;
+
+  const getHighestBar = (index) => {
+    const start = Math.max(0, index - lookback + 1);
+    let best = start;
+    for (let i = start + 1; i <= index; i++) {
+      if (Number(window[i].high) >= Number(window[best].high)) best = i;
+    }
+    let pivot = best;
+    for (let i = Math.max(start + 1, index - lookback + 1); i <= index - 1; i++) {
+      if (i + 2 <= index &&
+          Number(window[i].high) > Number(window[i - 1].high) &&
+          Number(window[i].high) > Number(window[i + 1].high) &&
+          Number(window[i].high) >= Number(window[pivot].high)) pivot = i;
+    }
+    return pivot;
+  };
+
+  const getLowestBar = (index) => {
+    const start = Math.max(0, index - lookback + 1);
+    let best = start;
+    for (let i = start + 1; i <= index; i++) {
+      if (Number(window[i].low) <= Number(window[best].low)) best = i;
+    }
+    let pivot = best;
+    for (let i = Math.max(start + 1, index - lookback + 1); i <= index - 1; i++) {
+      if (i + 2 <= index &&
+          Number(window[i].low) < Number(window[i - 1].low) &&
+          Number(window[i].low) < Number(window[i + 1].low) &&
+          Number(window[i].low) <= Number(window[pivot].low)) pivot = i;
+    }
+    return pivot;
+  };
+
+  let highIdx = 0;
+  let lowIdx  = 0;
+  let structureHigh = Number(window[0].high);
+  let structureLow  = Number(window[0].low);
+  let direction = 0; // 0=neutral, 1=bearish leg, 2=bullish leg
+
+  for (let i = 1; i < n; i++) {
+    const close = Number(window[i].close);
+    const highBroken =
+      (close > structureHigh &&
+       i - 1 > highIdx &&
+       Number(window[i - 1]?.close ?? -Infinity) <= structureHigh &&
+       Number(window[i - 2]?.close ?? -Infinity) <= structureHigh &&
+       Number(window[i - 3]?.close ?? -Infinity) <= structureHigh) ||
+      (direction === 1 && close > structureHigh);
+    const lowBroken =
+      (close < structureLow &&
+       i - 1 > lowIdx &&
+       Number(window[i - 1]?.close ?? Infinity) >= structureLow &&
+       Number(window[i - 2]?.close ?? Infinity) >= structureLow &&
+       Number(window[i - 3]?.close ?? Infinity) >= structureLow) ||
+      (direction === 2 && close < structureLow);
+
+    if (lowBroken) {
+      direction     = 1;
+      highIdx       = getHighestBar(i);
+      lowIdx        = i;
+      structureHigh = Number(window[highIdx]?.high ?? window[i].high);
+      structureLow  = Number(window[i].low);
+      continue;
+    }
+    if (highBroken) {
+      direction     = 2;
+      highIdx       = i;
+      lowIdx        = getLowestBar(i);
+      structureHigh = Number(window[i].high);
+      structureLow  = Number(window[lowIdx]?.low ?? window[i].low);
+      continue;
+    }
+    if ((direction === 0 || direction === 2) && Number(window[i].high) > structureHigh) {
+      structureHigh = Number(window[i].high);
+      highIdx       = i;
+    } else if ((direction === 0 || direction === 1) && Number(window[i].low) < structureLow) {
+      structureLow = Number(window[i].low);
+      lowIdx       = i;
+    }
+  }
+
+  return {
+    high:      structureHigh,
+    low:       structureLow,
+    highTime:  Number(window[highIdx]?.time ?? 0),
+    lowTime:   Number(window[lowIdx]?.time  ?? 0),
+    direction, // 1=bearish leg in progress, 2=bullish leg in progress
+  };
+}
+
 function detectTrigger(timeframeState) {
   const candles = timeframeState?.candles || [];
   if (candles.length < 12) {
@@ -992,799 +1277,97 @@ function detectTrigger(timeframeState) {
   return { direction: "Neutral", label: "No trigger" };
 }
 
-function isNearLevel(price, levelA, levelB, side) {
-  const currentPrice = Number(price);
-  const primary = Number(side === "long" ? levelA : levelB);
-  const opposite = Number(side === "long" ? levelB : levelA);
-  if (!Number.isFinite(currentPrice) || !Number.isFinite(primary)) return false;
-  const span = Number.isFinite(opposite) ? Math.abs(opposite - primary) : Math.abs(primary) * 0.003;
-  const tolerance = Math.max(span * 0.22, Math.abs(currentPrice) * 0.0008, 1.2);
-  return Math.abs(currentPrice - primary) <= tolerance;
-}
 
-function buildMtfSetup(side, m30State, m15State) {
-  const m30MarketState = m30State?.marketState || {};
-  const m15MarketState = m15State?.marketState || {};
-  const m30Price = Number(m30State?.candles?.[m30State.candles.length - 1]?.close);
-  const m15Price = Number(m15State?.candles?.[m15State.candles.length - 1]?.close);
-  const m30NearSupport = isNearLevel(m30Price, m30State?.levels?.support, m30State?.levels?.resistance, "long");
-  const m15NearSupport = isNearLevel(m15Price, m15State?.levels?.support, m15State?.levels?.resistance, "long");
-  const m30NearResistance = isNearLevel(m30Price, m30State?.levels?.support, m30State?.levels?.resistance, "short");
-  const m15NearResistance = isNearLevel(m15Price, m15State?.levels?.support, m15State?.levels?.resistance, "short");
-
-  if (side === "long") {
-    const locationPass = m30MarketState.rangePosition === "Lower";
-    const zonePass = m30NearSupport && m15NearSupport;
-    const structurePass =
-      (m15MarketState.trend === "Bullish" || m15MarketState.regime === "Transition") &&
-      m15MarketState.regime !== "Downtrend";
-    const passed = locationPass && zonePass && structurePass;
-    return {
-      passed,
-      label: passed ? "Armed Long Setup" : "No Long Setup",
-      actual: `M30 ${m30MarketState.rangePosition ?? "--"}, M30 S ${m30NearSupport ? "near" : "far"}, M15 S ${m15NearSupport ? "near" : "far"}, M15 ${m15MarketState.trend ?? "--"}/${m15MarketState.regime ?? "--"}`,
-    };
-  }
-
-  const locationPass = m30MarketState.rangePosition === "Upper";
-  const zonePass = m30NearResistance && m15NearResistance;
-  const structurePass =
-    (m15MarketState.trend === "Bearish" || m15MarketState.regime === "Transition") &&
-    m15MarketState.regime !== "Uptrend";
-  const passed = locationPass && zonePass && structurePass;
-  return {
-    passed,
-    label: passed ? "Armed Short Setup" : "No Short Setup",
-    actual: `M30 ${m30MarketState.rangePosition ?? "--"}, M30 R ${m30NearResistance ? "near" : "far"}, M15 R ${m15NearResistance ? "near" : "far"}, M15 ${m15MarketState.trend ?? "--"}/${m15MarketState.regime ?? "--"}`,
-  };
-}
-
-function detectLtfEntry(side, m5State, m1State) {
-  const m5Candles = m5State?.candles || [];
-  const m1Candles = m1State?.candles || [];
-  if (m5Candles.length < 8) {
-    return { passed: false, label: "Waiting", actual: "Need more M5 candles", stopAnchor: null };
-  }
-
-  const last = m5Candles[m5Candles.length - 1];
-  const previous = m5Candles[m5Candles.length - 2];
-  const localWindow = m5Candles.slice(-7, -1);
-  const previousHigh = Math.max(...localWindow.map((candle) => Number(candle.high)));
-  const previousLow = Math.min(...localWindow.map((candle) => Number(candle.low)));
-  const m5Support = Number(m5State?.levels?.support);
-  const m5Resistance = Number(m5State?.levels?.resistance);
-  const m5Rsi = Number(m5State?.indicators?.rsi14);
-  const m5VwapState = m5State?.indicators?.vwapState;
-  const m5EmaState = m5State?.indicators?.emaState;
-  const lastClose = Number(last.close);
-  const previousClose = Number(previous.close);
-  const bullishBody = Number(last.close) > Number(last.open);
-  const bearishBody = Number(last.close) < Number(last.open);
-
-  const m1Recent = m1Candles.slice(-6);
-  const m1HigherLow =
-    m1Recent.length >= 3 &&
-    Number(m1Recent[m1Recent.length - 1].low) > Number(m1Recent[m1Recent.length - 3].low);
-  const m1LowerHigh =
-    m1Recent.length >= 3 &&
-    Number(m1Recent[m1Recent.length - 1].high) < Number(m1Recent[m1Recent.length - 3].high);
-
-  if (side === "long") {
-    const closeBackAboveSupport =
-      Number(last.close) > m5Support &&
-      Number(previous.close) <= m5Support;
-    const bullishImpulse =
-      bullishBody &&
-      Number(last.close) > Number(previous.high);
-    const localBreak =
-      Number(last.close) > previousHigh;
-    const momentumContinuation =
-      bullishBody &&
-      lastClose > previousClose &&
-      m5VwapState === "Above" &&
-      m5EmaState === "Bull Stack";
-    const rsiPush =
-      bullishBody &&
-      lastClose > previousClose &&
-      m5EmaState === "Bull Stack" &&
-      Number.isFinite(m5Rsi) &&
-      m5Rsi >= 50;
-    const strongTrigger = closeBackAboveSupport || localBreak;
-    const confirmationCount = [bullishImpulse, momentumContinuation, rsiPush, m1HigherLow].filter(Boolean).length;
-    const passed = strongTrigger
-      ? confirmationCount >= 1
-      : confirmationCount >= 2 && bullishImpulse;
-    const triggerLabel = closeBackAboveSupport
-      ? "M5 close back above support"
-      : bullishImpulse
-        ? "M5 bullish candle above previous high"
-        : localBreak
-          ? "M5 break above recent local high"
-          : momentumContinuation
-            ? "M5 bullish continuation above VWAP"
-            : rsiPush
-              ? "M5 bullish push with EMA stack and RSI"
-              : "Waiting for long trigger";
-    return {
-      passed,
-      label: passed ? "Long Triggered" : "Long Waiting",
-      actual: `${triggerLabel}${m1HigherLow ? " + M1 higher low" : ""}`,
-      stopAnchor: passed ? Number(last.low) : null,
-    };
-  }
-
-  const closeBackBelowResistance =
-    Number(last.close) < m5Resistance &&
-    Number(previous.close) >= m5Resistance;
-  const bearishImpulse =
-    bearishBody &&
-    Number(last.close) < Number(previous.low);
-  const localBreak =
-    Number(last.close) < previousLow;
-  const momentumContinuation =
-    bearishBody &&
-    lastClose < previousClose &&
-    m5VwapState === "Below" &&
-    m5EmaState === "Bear Stack";
-  const rsiPush =
-    bearishBody &&
-    lastClose < previousClose &&
-    m5EmaState === "Bear Stack" &&
-    Number.isFinite(m5Rsi) &&
-    m5Rsi <= 50;
-  const strongTrigger = closeBackBelowResistance || localBreak;
-  const confirmationCount = [bearishImpulse, momentumContinuation, rsiPush, m1LowerHigh].filter(Boolean).length;
-  const passed = strongTrigger
-    ? confirmationCount >= 1
-    : confirmationCount >= 2 && bearishImpulse;
-  const triggerLabel = closeBackBelowResistance
-    ? "M5 close back below resistance"
-    : bearishImpulse
-      ? "M5 bearish candle below previous low"
-      : localBreak
-        ? "M5 break below recent local low"
-        : momentumContinuation
-          ? "M5 bearish continuation below VWAP"
-          : rsiPush
-            ? "M5 bearish push with EMA stack and RSI"
-            : "Waiting for short trigger";
-  return {
-      passed,
-      label: passed ? "Short Triggered" : "Short Waiting",
-      actual: `${triggerLabel}${m1LowerHigh ? " + M1 lower high" : ""}`,
-      stopAnchor: passed ? Number(last.high) : null,
-  };
-}
-
-function calculateRiskPlan(side, chartBundle, triggerInfo = null) {
-  const m5State = chartBundle.M5;
-  const m15State = chartBundle.M15;
-  const m30State = chartBundle.M30;
-  const entry = Number(m5State?.candles?.[m5State.candles.length - 1]?.close);
-  const atr = Number(m5State?.indicators?.atr14);
-  const buffer = Number.isFinite(atr) ? atr * 0.4 : 0;
-  if (!Number.isFinite(entry)) {
-    return {
-      entry: null,
-      sl: null,
-      tp: null,
-      riskDistance: null,
-      targetDistance: null,
-      checks: [],
-    };
-  }
-
-  const triggerPassed = Boolean(triggerInfo?.passed);
-  if (!triggerPassed) {
-    return {
-      entry,
-      sl: null,
-      tp: null,
-      riskDistance: null,
-      targetDistance: null,
-      checks: [
-        {
-          label: "Entry",
-          value: formatPrice(entry),
-          detail: "Current M5 close",
-          raw: entry,
-        },
-        {
-          label: "SL",
-          value: "--",
-          detail: "Waiting for live trigger before setting stop",
-          raw: null,
-        },
-        {
-          label: "TP",
-          value: "--",
-          detail: "Waiting for live trigger before selecting target",
-          raw: null,
-        },
-        {
-          label: "Distances",
-          value: "R -- | T --",
-          detail: "Risk plan appears only after a live trigger",
-          raw: null,
-        },
-      ],
-    };
-  }
-
-  let sl = null;
-  let tp = null;
-  let slDetail = `M5 liquidity / trigger swing ${Number.isFinite(atr) ? `+ ATR buffer ${formatPrice(buffer)}` : ""}`.trim();
-  let tpDetail = `Halfway to nearest ${side === "long" ? "buy-side liquidity" : "sell-side liquidity"} from M15`;
-  const recentM5 = (m5State?.candles || []).slice(-6);
-  const recentSwingLow = recentM5.length ? Math.min(...recentM5.map((candle) => Number(candle.low))) : null;
-  const recentSwingHigh = recentM5.length ? Math.max(...recentM5.map((candle) => Number(candle.high))) : null;
-  const minStopDistance = Number.isFinite(atr) ? Math.max(atr * 1.1, 8) : 8;
-  const maxStopDistance = Number.isFinite(atr) ? Math.max(atr * 2.4, 24) : 24;
-  const minStructureGap = Number.isFinite(atr) ? Math.max(atr * 0.45, 4) : 4;
-  const m5SellSideLiquidity = getLiquidityPools(m5State?.candles || [], "low", 24);
-  const m5BuySideLiquidity = getLiquidityPools(m5State?.candles || [], "high", 24);
-  const m15SellSideLiquidity = getLiquidityPools(m15State?.candles || [], "low", 80);
-  const m15BuySideLiquidity = getLiquidityPools(m15State?.candles || [], "high", 80);
-  const m15SwingLows = getSwingCandidates(m15State?.candles || [], "low", 100);
-  const m15SwingHighs = getSwingCandidates(m15State?.candles || [], "high", 100);
-  const m30SwingLows = getSwingCandidates(m30State?.candles || [], "low", 120);
-  const m30SwingHighs = getSwingCandidates(m30State?.candles || [], "high", 120);
-  const minTargetGapFloor = Number.isFinite(atr) ? Math.max(atr * 0.6, 4) : 4;
-  const m15SupportLevel = Number(m15State?.levels?.support);
-  const m15ResistanceLevel = Number(m15State?.levels?.resistance);
-  if (side === "long") {
-    const levelSupport = Number(m5State?.levels?.support);
-    const triggerLow = Number(triggerInfo?.stopAnchor);
-    const baseSl = chooseDirectionalAnchor(
-      entry,
-      [
-        triggerLow,
-        ...m5SellSideLiquidity,
-        recentSwingLow,
-        levelSupport,
-        ...m15SellSideLiquidity,
-        ...m15SwingLows,
-        m15SupportLevel,
-      ],
-      "below",
-      minStructureGap,
-      maxStopDistance
-    );
-    sl = Number.isFinite(baseSl) ? baseSl - buffer : null;
-    if (m5SellSideLiquidity.some((value) => Number.isFinite(baseSl) && Math.abs(value - baseSl) < 0.0001)) {
-      slDetail = `Below nearest M5 sell-side liquidity ${Number.isFinite(atr) ? `+ ATR buffer ${formatPrice(buffer)}` : ""}`.trim();
-    } else if (Number.isFinite(triggerLow) && Number.isFinite(baseSl) && Math.abs(triggerLow - baseSl) < 0.0001) {
-      slDetail = `Below M5 trigger candle low ${Number.isFinite(atr) ? `+ ATR buffer ${formatPrice(buffer)}` : ""}`.trim();
-    } else {
-      slDetail = `Below nearest M5 swing / level ${Number.isFinite(atr) ? `+ ATR buffer ${formatPrice(buffer)}` : ""}`.trim();
-    }
-    const normalizedStop = clampStopDistance(entry, sl, "long", minStopDistance, maxStopDistance);
-    sl = normalizedStop.value;
-    if (normalizedStop.mode === "floored") {
-      slDetail = `Below M5 structure with minimum volatility floor ${formatPrice(minStopDistance)}`;
-    } else if (normalizedStop.mode === "capped") {
-      slDetail = `Below M5 structure capped for execution ${formatPrice(maxStopDistance)}`;
-    }
-    const riskSeed = Number.isFinite(sl) ? Math.abs(entry - sl) : null;
-    const minTargetGap = Math.max(
-      minTargetGapFloor,
-      Number.isFinite(riskSeed) ? riskSeed * 1.0 : 0
-    );
-    const maxTargetGap = Number.isFinite(riskSeed)
-      ? Math.max(riskSeed * 3, Number.isFinite(atr) ? atr * 6 : 24)
-      : (Number.isFinite(atr) ? atr * 6 : 24);
-    const m15ResistanceCandidates = [
-      ...m15BuySideLiquidity,
-      ...m15SwingHighs,
-      Number(m15State?.levels?.resistance),
-    ]
-      .filter((value) => Number.isFinite(value) && value > entry)
-      .sort((left, right) => left - right);
-    const fullTarget = chooseDirectionalAnchor(entry, m15ResistanceCandidates, "above", minTargetGap, maxTargetGap);
-    const selectedTarget = chooseTakeProfit(entry, fullTarget, "long", riskSeed, minTargetGap);
-    tp = selectedTarget.value;
-    if (selectedTarget.mode === "scaled") {
-      tpDetail = "Scaled to 70% of nearest M15 target, capped to 5-15 points";
-    } else if (selectedTarget.mode === "floored") {
-      tpDetail = "Minimum target floor inside the 5-15 point band";
-    } else if (selectedTarget.mode === "full") {
-      tpDetail = "Full nearest M15 liquidity / swing target";
-    }
-    if (!Number.isFinite(tp)) {
-      const m30ResistanceCandidates = [
-        ...m30SwingHighs,
-        Number(m30State?.levels?.resistance),
-      ]
-        .filter((value) => Number.isFinite(value) && value > entry)
-        .sort((left, right) => left - right);
-      const fullFallback = chooseDirectionalAnchor(entry, m30ResistanceCandidates, "above", minTargetGap, maxTargetGap);
-      const fallbackTarget = chooseTakeProfit(entry, fullFallback, "long", riskSeed, minTargetGap);
-      tp = fallbackTarget.value;
-      if (fallbackTarget.mode === "scaled") {
-        tpDetail = "Scaled to 70% of nearest M30 target, capped to 5-15 points";
-      } else if (fallbackTarget.mode === "floored") {
-        tpDetail = "Minimum target floor inside the 5-15 point band";
-      } else if (fallbackTarget.mode === "full") {
-        tpDetail = "Full nearest M30 fallback target";
-      } else if (m15ResistanceCandidates.length) {
-        const nearest = m15ResistanceCandidates[0];
-        const nearestTarget = chooseTakeProfit(entry, nearest, "long", riskSeed, minTargetGap);
-        tp = nearestTarget.value;
-        if (Number.isFinite(tp)) {
-          tpDetail = nearestTarget.mode === "full"
-            ? "Full nearest M15 liquidity / swing target"
-            : nearestTarget.mode === "scaled"
-              ? "Scaled to 70% of nearest M15 target, capped to 5-15 points"
-              : "Minimum target floor inside the 5-15 point band";
-        }
-      } else if (m30ResistanceCandidates.length) {
-        const nearest = m30ResistanceCandidates[0];
-        const nearestTarget = chooseTakeProfit(entry, nearest, "long", riskSeed, minTargetGap);
-        tp = nearestTarget.value;
-        if (Number.isFinite(tp)) {
-          tpDetail = nearestTarget.mode === "full"
-            ? "Full nearest M30 fallback target"
-            : nearestTarget.mode === "scaled"
-              ? "Scaled to 70% of nearest M30 target, capped to 5-15 points"
-              : "Minimum target floor inside the 5-15 point band";
-        }
-      }
-    }
-  } else {
-    const levelResistance = Number(m5State?.levels?.resistance);
-    const triggerHigh = Number(triggerInfo?.stopAnchor);
-    const baseSl = chooseDirectionalAnchor(
-      entry,
-      [
-        triggerHigh,
-        ...m5BuySideLiquidity,
-        recentSwingHigh,
-        levelResistance,
-        ...m15BuySideLiquidity,
-        ...m15SwingHighs,
-        m15ResistanceLevel,
-      ],
-      "above",
-      minStructureGap,
-      maxStopDistance
-    );
-    sl = Number.isFinite(baseSl) ? baseSl + buffer : null;
-    if (m5BuySideLiquidity.some((value) => Number.isFinite(baseSl) && Math.abs(value - baseSl) < 0.0001)) {
-      slDetail = `Above nearest M5 buy-side liquidity ${Number.isFinite(atr) ? `+ ATR buffer ${formatPrice(buffer)}` : ""}`.trim();
-    } else if (Number.isFinite(triggerHigh) && Number.isFinite(baseSl) && Math.abs(triggerHigh - baseSl) < 0.0001) {
-      slDetail = `Above M5 trigger candle high ${Number.isFinite(atr) ? `+ ATR buffer ${formatPrice(buffer)}` : ""}`.trim();
-    } else {
-      slDetail = `Above nearest M5 swing / level ${Number.isFinite(atr) ? `+ ATR buffer ${formatPrice(buffer)}` : ""}`.trim();
-    }
-    const normalizedStop = clampStopDistance(entry, sl, "short", minStopDistance, maxStopDistance);
-    sl = normalizedStop.value;
-    if (normalizedStop.mode === "floored") {
-      slDetail = `Above M5 structure with minimum volatility floor ${formatPrice(minStopDistance)}`;
-    } else if (normalizedStop.mode === "capped") {
-      slDetail = `Above M5 structure capped for execution ${formatPrice(maxStopDistance)}`;
-    }
-    const riskSeed = Number.isFinite(sl) ? Math.abs(entry - sl) : null;
-    const minTargetGap = Math.max(
-      minTargetGapFloor,
-      Number.isFinite(riskSeed) ? riskSeed * 1.0 : 0
-    );
-    const maxTargetGap = Number.isFinite(riskSeed)
-      ? Math.max(riskSeed * 3, Number.isFinite(atr) ? atr * 6 : 24)
-      : (Number.isFinite(atr) ? atr * 6 : 24);
-    const m15SupportCandidates = [
-      ...m15SellSideLiquidity,
-      ...m15SwingLows,
-      Number(m15State?.levels?.support),
-    ]
-      .filter((value) => Number.isFinite(value) && value < entry)
-      .sort((left, right) => right - left);
-    const fullTarget = chooseDirectionalAnchor(entry, m15SupportCandidates, "below", minTargetGap, maxTargetGap);
-    const selectedTarget = chooseTakeProfit(entry, fullTarget, "short", riskSeed, minTargetGap);
-    tp = selectedTarget.value;
-    if (selectedTarget.mode === "scaled") {
-      tpDetail = "Scaled to 70% of nearest M15 target, capped to 5-15 points";
-    } else if (selectedTarget.mode === "floored") {
-      tpDetail = "Minimum target floor inside the 5-15 point band";
-    } else if (selectedTarget.mode === "full") {
-      tpDetail = "Full nearest M15 liquidity / swing target";
-    }
-    if (!Number.isFinite(tp)) {
-      const m30SupportCandidates = [
-        ...m30SwingLows,
-        Number(m30State?.levels?.support),
-      ]
-        .filter((value) => Number.isFinite(value) && value < entry)
-        .sort((left, right) => right - left);
-      const fullFallback = chooseDirectionalAnchor(entry, m30SupportCandidates, "below", minTargetGap, maxTargetGap);
-      const fallbackTarget = chooseTakeProfit(entry, fullFallback, "short", riskSeed, minTargetGap);
-      tp = fallbackTarget.value;
-      if (fallbackTarget.mode === "scaled") {
-        tpDetail = "Scaled to 70% of nearest M30 target, capped to 5-15 points";
-      } else if (fallbackTarget.mode === "floored") {
-        tpDetail = "Minimum target floor inside the 5-15 point band";
-      } else if (fallbackTarget.mode === "full") {
-        tpDetail = "Full nearest M30 fallback target";
-      } else if (m15SupportCandidates.length) {
-        const nearest = m15SupportCandidates[0];
-        const nearestTarget = chooseTakeProfit(entry, nearest, "short", riskSeed, minTargetGap);
-        tp = nearestTarget.value;
-        if (Number.isFinite(tp)) {
-          tpDetail = nearestTarget.mode === "full"
-            ? "Full nearest M15 liquidity / swing target"
-            : nearestTarget.mode === "scaled"
-              ? "Scaled to 70% of nearest M15 target, capped to 5-15 points"
-              : "Minimum target floor inside the 5-15 point band";
-        }
-      } else if (m30SupportCandidates.length) {
-        const nearest = m30SupportCandidates[0];
-        const nearestTarget = chooseTakeProfit(entry, nearest, "short", riskSeed, minTargetGap);
-        tp = nearestTarget.value;
-        if (Number.isFinite(tp)) {
-          tpDetail = nearestTarget.mode === "full"
-            ? "Full nearest M30 fallback target"
-            : nearestTarget.mode === "scaled"
-              ? "Scaled to 70% of nearest M30 target, capped to 5-15 points"
-              : "Minimum target floor inside the 5-15 point band";
-        }
-      }
-    }
-  }
-
-  const riskDistance = Number.isFinite(sl) ? Math.abs(entry - sl) : null;
-  const targetDistance = Number.isFinite(tp) ? Math.abs(tp - entry) : null;
-
-  return {
-    entry,
-    sl,
-    tp,
-    riskDistance,
-    targetDistance,
-    checks: [
-      {
-        label: "Entry",
-        value: formatPrice(entry),
-        detail: "Current M5 close",
-        raw: entry,
-      },
-      {
-        label: "SL",
-        value: Number.isFinite(sl) ? formatPrice(sl) : "--",
-        detail: slDetail,
-        raw: sl,
-      },
-      {
-        label: "TP",
-        value: Number.isFinite(tp) ? formatPrice(tp) : "--",
-        detail: tpDetail,
-        raw: tp,
-      },
-      {
-        label: "Distances",
-        value: `R ${Number.isFinite(riskDistance) ? formatPrice(riskDistance) : "--"} | T ${Number.isFinite(targetDistance) ? formatPrice(targetDistance) : "--"}`,
-        detail: "Risk and target distance",
-        raw: null,
-      },
-    ],
-  };
-}
+// ---------------------------------------------------------------------------
+// SMC — top-down structure overview (replaces old EMA/RSI/ADX scoring system)
+// Reads BOS/CHoCH direction, OB/FVG presence, and M5 entry zone from chartState.
+// ---------------------------------------------------------------------------
 
 function calculateTradeOverview() {
-  const h4 = chartState.H4?.marketState;
-  const h1 = chartState.H1?.marketState;
-  const m30 = chartState.M30?.marketState;
-  const m15 = chartState.M15?.marketState;
-  const m5 = chartState.M5?.marketState;
-  const m30State = chartState.M30;
-  const m15State = chartState.M15;
-  const m5State = chartState.M5;
-  const m1State = chartState.M1;
-  const h1State = chartState.H1;
-  const h4State = chartState.H4;
+  const m5Candles = chartState.M5?.candles || [];
+  const currentPrice = m5Candles.length ? Number(m5Candles[m5Candles.length - 1].close) : null;
 
-  if (!h4 || !h1 || !m30 || !m15 || !m5 || !m30State || !m15State || !m5State || !m1State || !h1State || !h4State) {
-    return {
-      action: "No Trade",
-      score: 0,
-      longScore: 0,
-      shortScore: 0,
-      longChecks: { mandatory: [], confirmation: [], risk: [] },
-      shortChecks: { mandatory: [], confirmation: [], risk: [] },
-      summary: "Waiting for enough timeframe data to evaluate long and short thresholds.",
-    };
-  }
+  // H1 structural bias from last BOS/CHoCH event
+  const h1Events = chartState.H1?.bosChoch || [];
+  const lastH1 = h1Events[h1Events.length - 1] || null;
+  const h1Bull = lastH1?.dir === "bull";
+  const h1Bear = lastH1?.dir === "bear";
+  const h1StructureLabel = lastH1 ? `${lastH1.type} ${lastH1.dir}` : "No event";
 
-  const htfLongAllowed =
-    (h4.regime === "Uptrend" || h4.regime === "Transition") &&
-    (h1.trend === "Bullish" || h1.regime === "Transition");
-  const htfShortAllowed =
-    (h4.regime === "Downtrend" || h4.regime === "Transition") &&
-    (h1.trend === "Bearish" || h1.regime === "Transition");
-  const htfLongCountertrend =
-    h4.regime === "Downtrend" || h1.trend === "Bearish";
-  const htfShortCountertrend =
-    h4.regime === "Uptrend" || h1.trend === "Bullish";
+  // M15 BOS/CHoCH direction
+  const m15Events = chartState.M15?.bosChoch || [];
+  const lastM15 = m15Events[m15Events.length - 1] || null;
+  const m15Bull = lastM15?.dir === "bull";
+  const m15Bear = lastM15?.dir === "bear";
+  const m15StructureLabel = lastM15 ? `${lastM15.type} ${lastM15.dir}` : "No event";
 
-  const mtfLong = buildMtfSetup("long", m30State, m15State);
-  const mtfShort = buildMtfSetup("short", m30State, m15State);
-  const ltfLong = detectLtfEntry("long", m5State, m1State);
-  const ltfShort = detectLtfEntry("short", m5State, m1State);
-  const longRisk = calculateRiskPlan("long", chartState, ltfLong);
-  const shortRisk = calculateRiskPlan("short", chartState, ltfShort);
+  // M15 PDA arrays (unmitigated OBs / unfilled FVGs)
+  const m15BullOBs  = chartState.M15?.orderBlocks?.bullish  || [];
+  const m15BearOBs  = chartState.M15?.orderBlocks?.bearish  || [];
+  const m15BullFVGs = chartState.M15?.fairValueGaps?.bullish || [];
+  const m15BearFVGs = chartState.M15?.fairValueGaps?.bearish || [];
 
-  const m5EmaLong = m5State?.indicators?.emaState === "Bull Stack";
-  const m5EmaShort = m5State?.indicators?.emaState === "Bear Stack";
-  const h1AdxReady = Number(h1State?.indicators?.adx14) >= 20;
-  const m15RsiLong = Number(m15State?.indicators?.rsi14) > 55;
-  const m15RsiShort = Number(m15State?.indicators?.rsi14) < 45;
-  const m5RsiLong = Number(m5State?.indicators?.rsi14) > 52;
-  const m5RsiShort = Number(m5State?.indicators?.rsi14) < 48;
-  const vwapLong = m5State?.indicators?.vwapState === "Above";
-  const vwapShort = m5State?.indicators?.vwapState === "Below";
+  // M5 PDA arrays
+  const m5BullOBs  = chartState.M5?.orderBlocks?.bullish  || [];
+  const m5BearOBs  = chartState.M5?.orderBlocks?.bearish  || [];
+  const m5BullFVGs = chartState.M5?.fairValueGaps?.bullish || [];
+  const m5BearFVGs = chartState.M5?.fairValueGaps?.bearish || [];
 
-  const longContext = [
-    {
-      label: "HTF picture",
-      expected: "Bullish picture from H4 and H1",
-      actual: `H4 ${h4.regime}, H1 ${h1.trend}/${h1.regime}`,
-      passed: htfLongAllowed,
-      score: htfLongAllowed ? 25 : 0,
-    },
-    {
-      label: "MTF placement",
-      expected: "Placed near support with M30 Lower/Middle",
-      actual: mtfLong.actual,
-      passed: mtfLong.passed,
-      score: mtfLong.passed ? 20 : 0,
-    },
-    {
-      label: "M5 EMA alignment",
-      expected: "EMA 9 > 20 > 50",
-      actual: m5State?.indicators?.emaState ?? "--",
-      passed: m5EmaLong,
-      score: m5EmaLong ? 15 : 0,
-    },
-  ];
+  // Is current price inside (or touching) the nearest unmitigated bullish / bearish PDA on M5?
+  const inBullM5OB  = currentPrice != null && m5BullOBs.find(ob  => currentPrice >= ob.low  && currentPrice <= ob.high  * 1.001);
+  const inBullM5FVG = currentPrice != null && m5BullFVGs.find(fvg => currentPrice >= fvg.low && currentPrice <= fvg.high * 1.001);
+  const inBearM5OB  = currentPrice != null && m5BearOBs.find(ob  => currentPrice >= ob.low  * 0.999 && currentPrice <= ob.high);
+  const inBearM5FVG = currentPrice != null && m5BearFVGs.find(fvg => currentPrice >= fvg.low * 0.999 && currentPrice <= fvg.high);
 
-  const shortContext = [
-    {
-      label: "HTF picture",
-      expected: "Bearish picture from H4 and H1",
-      actual: `H4 ${h4.regime}, H1 ${h1.trend}/${h1.regime}`,
-      passed: htfShortAllowed,
-      score: htfShortAllowed ? 25 : 0,
-    },
-    {
-      label: "MTF placement",
-      expected: "Placed near resistance with M30 Upper/Middle",
-      actual: mtfShort.actual,
-      passed: mtfShort.passed,
-      score: mtfShort.passed ? 20 : 0,
-    },
-    {
-      label: "M5 EMA alignment",
-      expected: "EMA 9 < 20 < 50",
-      actual: m5State?.indicators?.emaState ?? "--",
-      passed: m5EmaShort,
-      score: m5EmaShort ? 15 : 0,
-    },
-  ];
+  const longZoneLabel  = inBullM5OB  ? `In OB ${inBullM5OB.low?.toFixed(2)}-${inBullM5OB.high?.toFixed(2)}`
+                       : inBullM5FVG ? `In FVG ${inBullM5FVG.low?.toFixed(2)}-${inBullM5FVG.high?.toFixed(2)}`
+                       : `${m5BullOBs.length} OB, ${m5BullFVGs.length} FVG unmitigated`;
+  const shortZoneLabel = inBearM5OB  ? `In OB ${inBearM5OB.low?.toFixed(2)}-${inBearM5OB.high?.toFixed(2)}`
+                       : inBearM5FVG ? `In FVG ${inBearM5FVG.low?.toFixed(2)}-${inBearM5FVG.high?.toFixed(2)}`
+                       : `${m5BearOBs.length} OB, ${m5BearFVGs.length} FVG unmitigated`;
 
-  const longConfirmation = [
-    {
-      label: "H1 ADX",
-      expected: "ADX >= 20",
-      actual: Number.isFinite(h1State?.indicators?.adx14) ? h1State.indicators.adx14.toFixed(1) : "--",
-      passed: h1AdxReady,
-      score: h1AdxReady ? 8 : 0,
-    },
-    {
-      label: "M15 RSI",
-      expected: "RSI > 55",
-      actual: Number.isFinite(m15State?.indicators?.rsi14) ? m15State.indicators.rsi14.toFixed(1) : "--",
-      passed: m15RsiLong,
-      score: m15RsiLong ? 12 : 0,
-    },
-    {
-      label: "M5 RSI",
-      expected: "RSI > 52",
-      actual: Number.isFinite(m5State?.indicators?.rsi14) ? m5State.indicators.rsi14.toFixed(1) : "--",
-      passed: m5RsiLong,
-      score: m5RsiLong ? 12 : 0,
-    },
-    {
-      label: "M5 VWAP",
-      expected: "Price above VWAP",
-      actual: m5State?.indicators?.vwapState ?? "--",
-      passed: vwapLong,
-      score: vwapLong ? 10 : 0,
-    },
-  ];
-
-  const shortConfirmation = [
-    {
-      label: "H1 ADX",
-      expected: "ADX >= 20",
-      actual: Number.isFinite(h1State?.indicators?.adx14) ? h1State.indicators.adx14.toFixed(1) : "--",
-      passed: h1AdxReady,
-      score: h1AdxReady ? 8 : 0,
-    },
-    {
-      label: "M15 RSI",
-      expected: "RSI < 45",
-      actual: Number.isFinite(m15State?.indicators?.rsi14) ? m15State.indicators.rsi14.toFixed(1) : "--",
-      passed: m15RsiShort,
-      score: m15RsiShort ? 12 : 0,
-    },
-    {
-      label: "M5 RSI",
-      expected: "RSI < 48",
-      actual: Number.isFinite(m5State?.indicators?.rsi14) ? m5State.indicators.rsi14.toFixed(1) : "--",
-      passed: m5RsiShort,
-      score: m5RsiShort ? 12 : 0,
-    },
-    {
-      label: "M5 VWAP",
-      expected: "Price below VWAP",
-      actual: m5State?.indicators?.vwapState ?? "--",
-      passed: vwapShort,
-      score: vwapShort ? 10 : 0,
-    },
-  ];
-
-  const longBaseScore =
-    (ltfLong.passed ? 25 : 0) +
-    [...longContext, ...longConfirmation].reduce((sum, item) => sum + item.score, 0);
-  const shortBaseScore =
-    (ltfShort.passed ? 25 : 0) +
-    [...shortContext, ...shortConfirmation].reduce((sum, item) => sum + item.score, 0);
-  const longScore = longBaseScore;
-  const shortScore = shortBaseScore;
-  const longTriggerReady = ltfLong.passed;
-  const shortTriggerReady = ltfShort.passed;
-  const longMomentumPass = (m15RsiLong && vwapLong) || (m5RsiLong && vwapLong);
-  const shortMomentumPass = (m15RsiShort && vwapShort) || (m5RsiShort && vwapShort);
-  const longQualityGate = Boolean(m5EmaLong && htfLongAllowed && mtfLong.passed && longMomentumPass);
-  const shortQualityGate = Boolean(m5EmaShort && htfShortAllowed && mtfShort.passed && shortMomentumPass);
-
-  let action = "No Trade";
-  let score = Math.max(longScore, shortScore);
-  let tradeType = "No Setup";
-
-  if (longTriggerReady && longQualityGate && longScore >= TRADE_SCORE_THRESHOLD && longScore >= shortScore + TRADE_SCORE_EDGE) {
-    action = htfLongAllowed ? "Trend Buy Ready" : "Countertrend Buy Ready";
-    score = longScore;
-    tradeType = htfLongAllowed ? "Trend Buy" : htfLongCountertrend ? "Countertrend Buy" : "Buy";
-  } else if (shortTriggerReady && shortQualityGate && shortScore >= TRADE_SCORE_THRESHOLD && shortScore >= longScore + TRADE_SCORE_EDGE) {
-    action = htfShortAllowed ? "Trend Sell Ready" : "Countertrend Sell Ready";
-    score = shortScore;
-    tradeType = htfShortAllowed ? "Trend Sell" : htfShortCountertrend ? "Countertrend Sell" : "Sell";
-  }
-  const summary =
-    action === "No Trade"
-      ? `No trade yet. The engine now needs a live LTF trigger, a quality pass, plus a score of ${TRADE_SCORE_THRESHOLD} with at least a ${TRADE_SCORE_EDGE}-point edge. Long reads ${longScore}, short reads ${shortScore}.`
-      : `${action} with score ${score}. This is a ${tradeType.toLowerCase()} where the live trigger is active and the score lead is strong enough.`;
-
-  const longMandatory = [
-    {
-      label: "LTF detail",
-      expected: "M5 detail trigger for a long entry",
-      actual: ltfLong.actual,
-      passed: ltfLong.passed,
-      score: ltfLong.passed ? 25 : 0,
-    },
-    {
-      label: "Score threshold",
-      expected: `Score >= ${TRADE_SCORE_THRESHOLD}`,
-      actual: String(longScore),
-      passed: longScore >= TRADE_SCORE_THRESHOLD,
-      score: 0,
-    },
-    {
-      label: "Score edge",
-      expected: `Lead short by >= ${TRADE_SCORE_EDGE}`,
-      actual: `Lead ${longScore - shortScore}`,
-      passed: longScore >= shortScore + TRADE_SCORE_EDGE,
-      score: 0,
-    },
-    {
-      label: "Quality gate",
-      expected: "M5 EMA plus supportive HTF/MTF and momentum",
-      actual: longQualityGate ? "Passed" : "Waiting for cleaner long alignment",
-      passed: longQualityGate,
-      score: 0,
-    },
-  ];
-
-  const shortMandatory = [
-    {
-      label: "LTF detail",
-      expected: "M5 detail trigger for a short entry",
-      actual: ltfShort.actual,
-      passed: ltfShort.passed,
-      score: ltfShort.passed ? 25 : 0,
-    },
-    {
-      label: "Score threshold",
-      expected: `Score >= ${TRADE_SCORE_THRESHOLD}`,
-      actual: String(shortScore),
-      passed: shortScore >= TRADE_SCORE_THRESHOLD,
-      score: 0,
-    },
-    {
-      label: "Score edge",
-      expected: `Lead long by >= ${TRADE_SCORE_EDGE}`,
-      actual: `Lead ${shortScore - longScore}`,
-      passed: shortScore >= longScore + TRADE_SCORE_EDGE,
-      score: 0,
-    },
-    {
-      label: "Quality gate",
-      expected: "M5 EMA plus supportive HTF/MTF and momentum",
-      actual: shortQualityGate ? "Passed" : "Waiting for cleaner short alignment",
-      passed: shortQualityGate,
-      score: 0,
-    },
-  ];
-
-  return {
-    action,
-    score,
-    tradeType,
-    longScore,
-    shortScore,
-    longChecks: {
-      mandatory: longMandatory,
-      context: longContext,
-      confirmation: longConfirmation,
-      risk: longRisk.checks,
-    },
-    shortChecks: {
-      mandatory: shortMandatory,
-      context: shortContext,
-      confirmation: shortConfirmation,
-      risk: shortRisk.checks,
-    },
-    summary,
+  // Build long checks
+  const longChecks = {
+    structure: [
+      { label: "H1 structure (BOS/CHoCH)", expected: "Bullish break", actual: h1StructureLabel,  passed: h1Bull,  score: h1Bull  ? 30 : 0 },
+      { label: "M15 BOS/CHoCH confirms",   expected: "Bullish break", actual: m15StructureLabel, passed: m15Bull, score: m15Bull ? 20 : 0 },
+    ],
+    pda: [
+      { label: "M15 bullish PDA present", expected: "OB or FVG on M15", actual: `${m15BullOBs.length} OB, ${m15BullFVGs.length} FVG`, passed: m15BullOBs.length > 0 || m15BullFVGs.length > 0, score: (m15BullOBs.length > 0 || m15BullFVGs.length > 0) ? 20 : 0 },
+      { label: "M5 entry zone",            expected: "Price at OB or FVG", actual: longZoneLabel,  passed: Boolean(inBullM5OB || inBullM5FVG), score: (inBullM5OB || inBullM5FVG) ? 30 : 0 },
+    ],
   };
+
+  // Build short checks
+  const shortChecks = {
+    structure: [
+      { label: "H1 structure (BOS/CHoCH)", expected: "Bearish break", actual: h1StructureLabel,  passed: h1Bear,  score: h1Bear  ? 30 : 0 },
+      { label: "M15 BOS/CHoCH confirms",   expected: "Bearish break", actual: m15StructureLabel, passed: m15Bear, score: m15Bear ? 20 : 0 },
+    ],
+    pda: [
+      { label: "M15 bearish PDA present", expected: "OB or FVG on M15", actual: `${m15BearOBs.length} OB, ${m15BearFVGs.length} FVG`, passed: m15BearOBs.length > 0 || m15BearFVGs.length > 0, score: (m15BearOBs.length > 0 || m15BearFVGs.length > 0) ? 20 : 0 },
+      { label: "M5 entry zone",            expected: "Price at OB or FVG", actual: shortZoneLabel, passed: Boolean(inBearM5OB || inBearM5FVG), score: (inBearM5OB || inBearM5FVG) ? 30 : 0 },
+    ],
+  };
+
+  const allLong  = [...longChecks.structure,  ...longChecks.pda];
+  const allShort = [...shortChecks.structure, ...shortChecks.pda];
+  const longScore  = allLong.reduce((s, c) => s + c.score, 0);
+  const shortScore = allShort.reduce((s, c) => s + c.score, 0);
+
+  let action = "No Setup";
+  if      (longScore  >= SMC_SETUP_SCORE_THRESHOLD && longScore  > shortScore) action = "Buy Setup";
+  else if (shortScore >= SMC_SETUP_SCORE_THRESHOLD && shortScore > longScore)  action = "Sell Setup";
+
+  const summary = action === "No Setup"
+    ? `No aligned SMC setup yet. Long ${longScore}/100, Short ${shortScore}/100.`
+    : `${action} aligned. Long ${longScore}/100, Short ${shortScore}/100.`;
+
+  return { action, longScore, shortScore, longChecks, shortChecks, summary };
 }
 
-function renderChecks(container, groupedChecks) {
-  if (!container) return;
-  container.innerHTML = "";
-  const sections = [
-    { key: "mandatory", title: "Mandatory" },
-    { key: "context", title: "Context" },
-    { key: "confirmation", title: "Confirmation" },
-    { key: "risk", title: "Risk" },
-  ];
-  for (const section of sections) {
-    const checks = groupedChecks?.[section.key] || [];
-    if (!checks.length) continue;
-    const block = document.createElement("section");
-    block.className = "overview-check-group";
-    const title = document.createElement("h4");
-    title.className = "overview-check-group-title";
-    title.textContent = section.title;
-    block.appendChild(title);
-
-    for (const item of checks) {
-      const isRisk = section.key === "risk";
-      const row = document.createElement("div");
-      row.className = `overview-check ${isRisk ? "is-risk" : item.passed ? "is-pass" : "is-fail"}`;
-      row.innerHTML = `
-        <div class="overview-check-top">
-          <span>${item.label}</span>
-          <strong>${isRisk ? item.value : item.passed ? `+${item.score}` : "+0"}</strong>
-        </div>
-        <div class="overview-check-bottom">
-          <span>${isRisk ? item.detail : `Need: ${item.expected}`}</span>
-          <span>${isRisk ? "" : `Now: ${item.actual}`}</span>
-        </div>
-      `;
-      block.appendChild(row);
-    }
-    container.appendChild(block);
-  }
+function renderTradeOverview() {
+  latestTradeOverview = calculateTradeOverview();
 }
 
 function buildNewsEventsByDate() {
@@ -2040,10 +1623,6 @@ async function maybeExecuteAutoTrade() {
   return;
 }
 
-function renderTradeOverview() {
-  latestTradeOverview = null;
-}
-
 function modelSafeToken(model) {
   return String(model || "model").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase() || "model";
 }
@@ -2214,9 +1793,28 @@ function normalizeIndicatorChecks(value) {
 
 function getTradePlanTone(decision) {
   const side = String(decision || "").toLowerCase();
-  if (side === "buy") return { badge: "BUY THE PULLBACK", prefix: "BUY", tone: "is-buy" };
-  if (side === "sell") return { badge: "SELL THE POP", prefix: "SELL", tone: "is-sell" };
+  if (side === "buy") return { badge: "BULLISH SMC SETUP", prefix: "BUY", tone: "is-buy" };
+  if (side === "sell") return { badge: "BEARISH SMC SETUP", prefix: "SELL", tone: "is-sell" };
   return { badge: "WAIT FOR CLEANER STRUCTURE", prefix: "WAIT", tone: "is-wait" };
+}
+
+function getZoneSourceLabel(signal) {
+  const map = {
+    bullish_ob_retest:        "Bullish OB Retest",
+    bullish_fvg_retest:       "Bullish FVG Retest",
+    sell_side_sweep_reclaim:  "Sell-Side Sweep Reclaim",
+    failed_breakdown_reclaim: "Failed Breakdown Reclaim",
+    bullish_bos_retest:       "Bullish BOS Retest",
+    bullish_displacement:     "Bullish Displacement",
+    bearish_ob_retest:        "Bearish OB Retest",
+    bearish_fvg_retest:       "Bearish FVG Retest",
+    buy_side_sweep_reject:    "Buy-Side Sweep Rejection",
+    failed_breakout_reject:   "Failed Breakout Rejection",
+    bearish_bos_retest:       "Bearish BOS Retest",
+    bearish_displacement:     "Bearish Displacement",
+  };
+  const key = String(signal || "").trim();
+  return key ? (map[key] || key.replaceAll("_", " ")) : "";
 }
 
 function renderTradePlanHtml(payload) {
@@ -2226,88 +1824,96 @@ function renderTradePlanHtml(payload) {
 
   const tone = getTradePlanTone(payload.decision);
   const isLivePlan = Boolean(payload.should_trade) && String(payload.trigger_state || "").toLowerCase() === "active_now";
+  const entryChecks = payload.entry_checks && typeof payload.entry_checks === "object" ? payload.entry_checks : {};
+  const signalText = String(entryChecks.signal || "").trim();
+  const zoneSourceLabel = getZoneSourceLabel(signalText);
+  const smcParameters = payload.smc_parameters && typeof payload.smc_parameters === "object" ? payload.smc_parameters : {};
+
   const zoneText = String(payload.zone || "").trim()
     || (Number.isFinite(Number(payload.entry)) ? formatPrice(payload.entry) : "")
-    || "No live zone yet";
-  const waitItems = normalizeAiList(payload.wait_for, [
-    String(payload.trigger || "").trim() || "Wait for a valid trigger.",
-  ]);
+    || "No zone identified yet";
+
   const whyItems = normalizeAiList(payload.why, [
-    String(payload.reason || "").trim()
-      || String(payload.location || "").trim()
-      || "No grounded reason returned.",
+    String(payload.reason || "").trim() || "No grounded reason returned.",
   ]);
-  const avoidItems = normalizeAiList(payload.avoid, ["Do not force a trade."]);
   const blockedItems = normalizeAiList(payload.blocked_reasons, []);
-  const indicatorChecks = normalizeIndicatorChecks(payload.indicator_checks);
-  const indicatorSummary = String(payload.indicator_summary || "").trim();
+
   const tpItems = isLivePlan ? normalizeAiList(payload.tp_plan) : [];
   if (isLivePlan && !tpItems.length && Number.isFinite(Number(payload.tp))) {
     tpItems.push(`TP1: ${formatPrice(payload.tp)}`);
   }
 
   const setupLabel = (String(payload.setup || "").trim() || tone.badge).toUpperCase();
-  const entryText = String(payload.entry_note || "").trim()
-    || String(payload.plan || "").trim()
-    || (isLivePlan && Number.isFinite(Number(payload.entry))
-      ? `${String(payload.decision || "").toUpperCase()} near ${formatPrice(payload.entry)}`
-      : "Stand aside until the trigger is live.");
-  const slText = isLivePlan && Number.isFinite(Number(payload.sl))
-    ? formatPrice(payload.sl)
-    : "--";
+  const slText = isLivePlan && Number.isFinite(Number(payload.sl)) ? formatPrice(payload.sl) : "--";
   const rrText = isLivePlan && Number.isFinite(Number(payload.rr)) ? Number(payload.rr).toFixed(2) : "--";
   const triggerState = String(payload.trigger_state || "waiting").replaceAll("_", " ");
-  const contextText = String(payload.context_summary || "").trim()
-    || [payload.market_phase, payload.bias, payload.location].filter(Boolean).join(" | ")
-    || "Context still needs a clearer directional story.";
-  const triggerText = String(payload.trigger_summary || "").trim()
-    || String(payload.trigger || "").trim()
-    || "Waiting for trigger confirmation.";
   const executionText = String(payload.execution_summary || "").trim()
-    || entryText;
+    || String(payload.plan || "").trim()
+    || (isLivePlan && Number.isFinite(Number(payload.entry))
+      ? `${String(payload.decision || "").toUpperCase()} from ${zoneText}`
+      : "");
+  const invalidationText = String(payload.invalidation || "").trim();
+
+  const zoneGate = entryChecks.zone_ok === true ? "Aligned" : entryChecks.zone_ok === false ? "Waiting" : "--";
+  const triggerGate = entryChecks.confirmation_ok === true ? "Confirmed" : entryChecks.confirmation_ok === false ? "Waiting" : "--";
+
+  const pipelineRows = [
+    `Bias: ${String(payload.bias || "mixed").toUpperCase()} | Phase: ${String(payload.market_phase || "transition").toUpperCase()}`,
+    `Location: ${String(payload.location || "middle").replaceAll("_", " ")}`,
+    `Zone: ${zoneGate}`,
+    `M5/M1: ${triggerGate}`,
+  ];
+  if (signalText) pipelineRows.splice(2, 0, `Signal: ${zoneSourceLabel || signalText.replaceAll("_", " ")}`);
+
+  const smcRows = [
+    `H1 Bias: ${String(smcParameters.h1Bias || payload.bias || "--").toUpperCase()}`,
+    `M15 Phase: ${String(smcParameters.m15Phase || payload.market_phase || "--").toUpperCase()}`,
+    `M15 High: ${Number.isFinite(Number(smcParameters.m15StructureHigh)) ? formatPrice(smcParameters.m15StructureHigh) : "--"}`,
+    `M15 Low: ${Number.isFinite(Number(smcParameters.m15StructureLow)) ? formatPrice(smcParameters.m15StructureLow) : "--"}`,
+    `EQ: ${Number.isFinite(Number(smcParameters.m15Equilibrium)) ? formatPrice(smcParameters.m15Equilibrium) : "--"}`,
+    `PD Position: ${String(smcParameters.m15PdPosition || "--").replaceAll("_", " ")}`,
+    `Discount: ${String(smcParameters.m15DiscountZone || "--")}`,
+    `Premium: ${String(smcParameters.m15PremiumZone || "--")}`,
+    `Buy Zone: ${String(smcParameters.buyExecutionZone || "--")}`,
+    `Sell Zone: ${String(smcParameters.sellExecutionZone || "--")}`,
+    `Price: ${Number.isFinite(Number(smcParameters.activePrice)) ? formatPrice(smcParameters.activePrice) : "--"}`,
+    `LTF Tone: ${String(smcParameters.ltfTone || "--").toUpperCase()}`,
+  ];
+
+  const zoneHeading = isLivePlan ? "Entry Zone" : "Watch Zone";
+  const zoneNote = isLivePlan
+    ? ""
+    : `<p class="ai-plan-zone-note">Price needs to return here for the setup to activate.</p>`;
+  const zoneSourceHtml = zoneSourceLabel
+    ? `<span class="ai-plan-zone-source">${escapeHtml(zoneSourceLabel)}</span>`
+    : "";
 
   return `
     <article class="ai-plan-card ${tone.tone}">
       <div class="ai-plan-topline">
-        <span class="ai-plan-kicker">Trade Plan</span>
+        <span class="ai-plan-kicker">SMC Plan</span>
         <span class="ai-plan-trigger">Trigger: ${escapeHtml(triggerState.toUpperCase())}</span>
       </div>
       <h3 class="ai-plan-title"><span class="ai-plan-title-prefix">${escapeHtml(tone.prefix)}</span> ${escapeHtml(setupLabel)}</h3>
       <div class="ai-plan-grid">
-        <section class="ai-plan-section">
-          <h4>Zone</h4>
-          <p class="ai-plan-zone">${escapeHtml(zoneText)}</p>
+        <section class="ai-plan-section ai-plan-section-zone">
+          <h4>${escapeHtml(zoneHeading)}</h4>
+          <p class="ai-plan-zone">${escapeHtml(zoneText)} ${zoneSourceHtml}</p>
+          ${zoneNote}
         </section>
         <section class="ai-plan-section">
-          <h4>Why</h4>
+          <h4>Pipeline</h4>
+          <ul>${pipelineRows.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>
+        <section class="ai-plan-section">
+          <h4>SMC Parameters</h4>
+          <ul>${smcRows.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>
+        <section class="ai-plan-section">
+          <h4>SMC Read</h4>
           <ul>${whyItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
         </section>
-        <section class="ai-plan-section">
-          <h4>What to wait for</h4>
-          <ul>${waitItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
-        </section>
-        <section class="ai-plan-section">
-          <h4>Entry</h4>
-          <p>${escapeHtml(entryText)}</p>
-        </section>
-        <section class="ai-plan-section ai-plan-breakdown">
-          <h4>Context</h4>
-          <p>${escapeHtml(contextText)}</p>
-        </section>
-        <section class="ai-plan-section ai-plan-breakdown">
-          <h4>Trigger</h4>
-          <p>${escapeHtml(triggerText)}</p>
-        </section>
-        <section class="ai-plan-section ai-plan-breakdown">
-          <h4>Execution</h4>
-          <p>${escapeHtml(executionText)}</p>
-        </section>
-        ${indicatorChecks.length ? `
-        <section class="ai-plan-section ai-plan-breakdown">
-          <h4>Decision Gate</h4>
-          ${indicatorSummary ? `<p>${escapeHtml(indicatorSummary)}</p>` : ""}
-          <ul>${indicatorChecks.map((item) => `<li>${escapeHtml(`${item.label}: ${item.actual} (need ${item.expected}) ${item.passed ? "PASS" : "WAIT"}`)}</li>`).join("")}</ul>
-        </section>` : ""}
+        ${isLivePlan ? `
         <section class="ai-plan-stats">
           <div class="ai-plan-stat">
             <span>SL</span>
@@ -2323,16 +1929,22 @@ function renderTradePlanHtml(payload) {
           </div>
         </section>
         <section class="ai-plan-section">
-          <h4>Take profit plan</h4>
-          <ul>${(tpItems.length ? tpItems : [isLivePlan ? "No TP plan returned." : "Take profit stays hidden until the trigger is active."]).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+          <h4>Execution</h4>
+          <p>${escapeHtml(executionText)}</p>
         </section>
-        <section class="ai-plan-section ai-plan-warning">
-          <h4>What you must NOT do</h4>
-          <ul>${avoidItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
-        </section>
+        ${invalidationText ? `
+        <section class="ai-plan-section ai-plan-breakdown">
+          <h4>Invalidation</h4>
+          <p>${escapeHtml(invalidationText)}</p>
+        </section>` : ""}
+        ${tpItems.length ? `
+        <section class="ai-plan-section">
+          <h4>Targets</h4>
+          <ul>${tpItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </section>` : ""}` : ""}
         ${blockedItems.length ? `
         <section class="ai-plan-section ai-plan-warning">
-          <h4>Blocked By</h4>
+          <h4>Why No Trade</h4>
           <ul>${blockedItems.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
         </section>` : ""}
       </div>
@@ -2500,9 +2112,28 @@ function refreshDerivedState(state) {
   state.levels = calculateLevels(state.candles);
   state.marketState = calculateMarketState(state.candles);
   state.indicators = null;
-  state.volatility = {
-    atr14: calculateATR(state.candles, 14),
+  const atr14 = calculateATR(state.candles, 14);
+  state.volatility = { atr14 };
+  // SMC overlays — computed from the full loaded candle set
+  const atr = atr14 || 6;
+  state.orderBlocks = {
+    bullish: computeOrderBlocks(state.candles, "buy",  atr),
+    bearish: computeOrderBlocks(state.candles, "sell", atr),
   };
+  state.fairValueGaps = {
+    bullish: computeFVGs(state.candles, "buy"),
+    bearish: computeFVGs(state.candles, "sell"),
+  };
+  // EMAs for all periods used by any TF (cheap to compute, skip if too few candles)
+  state.emaValues = {
+    9:   computeEMA(state.candles, 9),
+    20:  computeEMA(state.candles, 20),
+    50:  computeEMA(state.candles, 50),
+    200: computeEMA(state.candles, 200),
+  };
+  state.vwapValues      = computeVWAP(state.candles);
+  state.bosChoch        = computeBOSCHoCH(state.candles);
+  state.activeStructure = computeActiveStructure(state.candles);
 }
 
 function setTrendBadge(element, trend) {
@@ -2592,8 +2223,22 @@ function drawChart(timeframe) {
   const canvas = domRefs[timeframe]?.canvas;
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
-  const visible = getVisibleCandles(state);
-  const { width, height, padding, chartWidth, chartHeight, barSpacing } = getChartGeometry(canvas, visible.length);
+
+  // --- visible slice + index range (needed to align EMA/VWAP arrays) ---
+  const allCandles = state.candles;
+  const count = Math.max(20, Math.min(state.visibleCount, allCandles.length));
+  const sliceEnd = Math.max(count, allCandles.length - state.offset);
+  const sliceStart = Math.max(0, sliceEnd - count);
+  const visible = allCandles.slice(sliceStart, sliceEnd);
+
+  const { width, height, padding, chartWidth, chartHeight, barSpacing } =
+    getChartGeometry(canvas, visible.length, state.offset === 0);
+
+  // OB/FVG boxes end here — at live edge they extend to chart border, when scrolled they
+  // cap at the last visible candle so historical views stay clean.
+  const xActiveRight = state.offset === 0
+    ? width - padding.right
+    : Math.min(padding.left + visible.length * barSpacing, width - padding.right);
 
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#040811";
@@ -2606,114 +2251,382 @@ function drawChart(timeframe) {
     return;
   }
 
-  const highs = visible.map((candle) => Number(candle.high));
-  const lows = visible.map((candle) => Number(candle.low));
+  // Expand price range slightly to stop OB/FVG bands from touching edges
+  const highs = visible.map((c) => Number(c.high));
+  const lows  = visible.map((c) => Number(c.low));
   const maxPrice = Math.max(...highs);
   const minPrice = Math.min(...lows);
   const range = Math.max(maxPrice - minPrice, 0.00001);
-  const priceToY = (price) => padding.top + ((maxPrice - price) / range) * chartHeight;
+  const priceToY = (p) => padding.top + ((maxPrice - p) / range) * chartHeight;
+  const inPriceRange = (lo, hi) => hi >= minPrice && lo <= maxPrice;
+  // Any overlay whose originating candle is newer than the last visible candle gets clipped.
+  const visibleTimeEnd = visible.length > 0 ? Number(visible[visible.length - 1].time) : Infinity;
 
-  ctx.strokeStyle = "rgba(145, 182, 255, 0.10)";
+  // ── 1. Grid ─────────────────────────────────────────────────────────────
+  ctx.strokeStyle = "rgba(145, 182, 255, 0.08)";
   ctx.lineWidth = 1;
-  for (let row = 0; row <= 5; row += 1) {
+  for (let row = 0; row <= 5; row++) {
     const y = padding.top + (chartHeight / 5) * row;
-    ctx.beginPath();
-    ctx.moveTo(padding.left, y);
-    ctx.lineTo(width - padding.right, y);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padding.left, y); ctx.lineTo(width - padding.right, y); ctx.stroke();
   }
-  for (let col = 0; col <= 6; col += 1) {
+  for (let col = 0; col <= 6; col++) {
     const x = padding.left + (chartWidth / 6) * col;
-    ctx.beginPath();
-    ctx.moveTo(x, padding.top);
-    ctx.lineTo(x, height - padding.bottom);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, padding.top); ctx.lineTo(x, height - padding.bottom); ctx.stroke();
   }
 
+  const overlays = TIMEFRAME_OVERLAYS[timeframe] || {};
+
+  // ── 2. Fair Value Gaps — positioned rectangles from origin candle to right edge
+  const drawFVGs = (fvgs, fillColor, borderColor, midColor) => {
+    for (const fvg of (fvgs || [])) {
+      if (Number(fvg.time) > visibleTimeEnd) continue;
+      if (!inPriceRange(fvg.low, fvg.high)) continue;
+      const xStart  = timeToX(fvg.time, visible, padding, barSpacing);
+      const xEnd    = xActiveRight;
+      const rectW   = Math.max(4, xEnd - xStart);
+      const yTop    = priceToY(fvg.high);
+      const yBottom = priceToY(fvg.low);
+      const rectH   = Math.max(1, yBottom - yTop);
+      // Fill
+      ctx.fillStyle = fillColor;
+      ctx.fillRect(xStart, yTop, rectW, rectH);
+      // Border top/bottom
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = 0.8;
+      ctx.setLineDash([]);
+      ctx.strokeRect(xStart, yTop, rectW, rectH);
+      // Midpoint dashed line
+      const yMid = priceToY(fvg.midpoint);
+      ctx.strokeStyle = midColor;
+      ctx.lineWidth = 0.7;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(xStart, yMid); ctx.lineTo(xEnd, yMid); ctx.stroke();
+      ctx.setLineDash([]);
+      // Label
+      ctx.fillStyle = borderColor;
+      ctx.font = "bold 9px Segoe UI";
+      ctx.fillText("FVG", xStart + 3, yTop + 10);
+    }
+  };
+  drawFVGs(state.fairValueGaps?.bullish, "rgba(34,197,94,0.08)", "rgba(34,197,94,0.55)", "rgba(34,197,94,0.70)");
+  drawFVGs(state.fairValueGaps?.bearish, "rgba(239,68,68,0.08)", "rgba(239,68,68,0.55)", "rgba(239,68,68,0.70)");
+
+  // ── 3. Order Blocks — positioned rectangles anchored at originating candle
+  const drawOBs = (obs, fillColor, borderColor, labelColor) => {
+    for (const ob of (obs || [])) {
+      if (Number(ob.time) > visibleTimeEnd) continue;
+      if (!inPriceRange(ob.low, ob.high)) continue;
+      const xStart  = timeToX(ob.time, visible, padding, barSpacing);
+      const xEnd    = xActiveRight;
+      const rectW   = Math.max(4, xEnd - xStart);
+      const yTop    = priceToY(ob.high);
+      const yBottom = priceToY(ob.low);
+      const rectH   = Math.max(2, yBottom - yTop);
+      // Fill body
+      ctx.fillStyle = fillColor;
+      ctx.fillRect(xStart, yTop, rectW, rectH);
+      // Border
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([]);
+      ctx.strokeRect(xStart, yTop, rectW, rectH);
+      // Midpoint line
+      const yMid = priceToY(ob.midpoint);
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = 0.7;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(xStart, yMid); ctx.lineTo(xEnd, yMid); ctx.stroke();
+      ctx.setLineDash([]);
+      // "OB" label inside box (top-left) + price range outside right edge
+      ctx.fillStyle = labelColor;
+      ctx.font = "bold 10px Segoe UI";
+      ctx.fillText("OB", xStart + 3, yTop + 11);
+      if (state.offset === 0) {
+        ctx.font = "9px Segoe UI";
+        ctx.fillText(`${formatPrice(ob.low)}–${formatPrice(ob.high)}`, xEnd + 3, yTop + 10);
+      }
+    }
+  };
+  drawOBs(state.orderBlocks?.bullish, "rgba(34,197,94,0.12)", "rgba(34,197,94,0.65)", "rgba(34,197,94,0.95)");
+  drawOBs(state.orderBlocks?.bearish, "rgba(239,68,68,0.12)", "rgba(239,68,68,0.65)", "rgba(239,68,68,0.95)");
+
+  // ── 4. Support / Resistance lines ────────────────────────────────────────
   if (state.levels?.resistance != null) {
     const y = priceToY(Number(state.levels.resistance));
-    ctx.strokeStyle = "rgba(239, 68, 68, 0.9)";
+    ctx.strokeStyle = "rgba(239,68,68,0.85)";
     ctx.lineWidth = 1.2;
     ctx.setLineDash([8, 6]);
-    ctx.beginPath();
-    ctx.moveTo(padding.left, y);
-    ctx.lineTo(width - padding.right, y);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padding.left, y); ctx.lineTo(width - padding.right, y); ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "rgba(239, 68, 68, 0.95)";
-    ctx.font = "12px Segoe UI";
-    ctx.fillText(`R ${formatPrice(state.levels.resistance)}`, padding.left + 8, y - 6);
+    ctx.fillStyle = "rgba(239,68,68,0.95)";
+    ctx.font = "11px Segoe UI";
+    ctx.fillText(`R ${formatPrice(state.levels.resistance)}`, padding.left + 6, y - 5);
   }
-
   if (state.levels?.support != null) {
     const y = priceToY(Number(state.levels.support));
-    ctx.strokeStyle = "rgba(103, 166, 255, 0.85)";
+    ctx.strokeStyle = "rgba(103,166,255,0.80)";
     ctx.lineWidth = 1.2;
     ctx.setLineDash([8, 6]);
-    ctx.beginPath();
-    ctx.moveTo(padding.left, y);
-    ctx.lineTo(width - padding.right, y);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padding.left, y); ctx.lineTo(width - padding.right, y); ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "rgba(103, 166, 255, 0.92)";
-    ctx.font = "12px Segoe UI";
-    ctx.fillText(`S ${formatPrice(state.levels.support)}`, padding.left + 8, y - 6);
+    ctx.fillStyle = "rgba(103,166,255,0.92)";
+    ctx.font = "11px Segoe UI";
+    ctx.fillText(`S ${formatPrice(state.levels.support)}`, padding.left + 6, y - 5);
   }
 
+  // ── 5. Swing high / low tick marks (MTF and HTF only) ────────────────────
+  if (overlays.swings) {
+    const swingHighs = getSwingCandidates(visible, "high", 40);
+    const swingLows  = getSwingCandidates(visible, "low",  40);
+    ctx.strokeStyle = "rgba(251,191,36,0.45)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 4]);
+    for (const lvl of swingHighs) {
+      if (!inPriceRange(lvl, lvl)) continue;
+      const y = priceToY(lvl);
+      ctx.beginPath(); ctx.moveTo(padding.left, y); ctx.lineTo(width - padding.right, y); ctx.stroke();
+    }
+    ctx.strokeStyle = "rgba(103,166,255,0.35)";
+    for (const lvl of swingLows) {
+      if (!inPriceRange(lvl, lvl)) continue;
+      const y = priceToY(lvl);
+      ctx.beginPath(); ctx.moveTo(padding.left, y); ctx.lineTo(width - padding.right, y); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
+  // ── 6. Candles ───────────────────────────────────────────────────────────
   const candleWidth = Math.max(3, barSpacing * 0.56);
   visible.forEach((candle, index) => {
-    const x = padding.left + index * barSpacing + (barSpacing - candleWidth) / 2;
-    const openY = priceToY(Number(candle.open));
+    const x      = padding.left + index * barSpacing + (barSpacing - candleWidth) / 2;
+    const openY  = priceToY(Number(candle.open));
     const closeY = priceToY(Number(candle.close));
-    const highY = priceToY(Number(candle.high));
-    const lowY = priceToY(Number(candle.low));
-    const bullish = Number(candle.close) >= Number(candle.open);
-    ctx.strokeStyle = bullish ? "rgba(103, 166, 255, 0.92)" : "rgba(160, 168, 183, 0.92)";
+    const highY  = priceToY(Number(candle.high));
+    const lowY   = priceToY(Number(candle.low));
+    const bull   = Number(candle.close) >= Number(candle.open);
+    ctx.strokeStyle = bull ? "rgba(103,166,255,0.92)" : "rgba(160,168,183,0.92)";
     ctx.lineWidth = 1.4;
-    ctx.beginPath();
-    ctx.moveTo(x + candleWidth / 2, highY);
-    ctx.lineTo(x + candleWidth / 2, lowY);
-    ctx.stroke();
-    ctx.fillStyle = bullish ? "rgba(103, 166, 255, 0.9)" : "rgba(160, 168, 183, 0.9)";
+    ctx.beginPath(); ctx.moveTo(x + candleWidth / 2, highY); ctx.lineTo(x + candleWidth / 2, lowY); ctx.stroke();
+    ctx.fillStyle = bull ? "rgba(103,166,255,0.90)" : "rgba(160,168,183,0.90)";
     ctx.fillRect(x, Math.min(openY, closeY), candleWidth, Math.max(2, Math.abs(closeY - openY)));
   });
 
-  ctx.fillStyle = "rgba(154, 176, 211, 0.92)";
-  ctx.font = "12px Segoe UI";
-  for (let row = 0; row <= 5; row += 1) {
+  // ── 7. BOS / CHoCH — all timeframes ─────────────────────────────────────
+  {
+    const allC = state.candles || [];
+    const wcStart = Math.max(0, allC.length - Math.min(180, allC.length));
+    const structureWindow = allC.slice(wcStart);
+
+    for (const ev of (state.bosChoch || [])) {
+      const levelPrice = Number(ev.level);
+      if (!Number.isFinite(levelPrice) || !inPriceRange(levelPrice, levelPrice)) continue;
+
+      const levelCandle = structureWindow[ev.levelIdx];
+      const breakCandle = structureWindow[ev.breakIdx];
+      if (!levelCandle || !breakCandle) continue;
+      if (Number(breakCandle.time) > visibleTimeEnd) continue;
+
+      const xLevel = timeToX(Number(levelCandle.time), visible, padding, barSpacing);
+      const xBreak = timeToX(Number(breakCandle.time), visible, padding, barSpacing);
+      if (xLevel === padding.left && xBreak === padding.left) continue;
+
+      const y        = priceToY(levelPrice);
+      const isBOS    = ev.type === "BOS";
+      const lineColor = isBOS ? "rgba(184,184,184,0.85)" : "rgba(247,208,70,0.95)";
+      const lineEnd  = Math.min(xBreak, width - padding.right - 4);
+      const labelText = isBOS ? "BOS" : "CHoCH";
+      const midX     = xLevel + (lineEnd - xLevel) * 0.5;
+
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth   = isBOS ? 1 : 1.2;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(xLevel, y);
+      ctx.lineTo(lineEnd, y);
+      ctx.stroke();
+
+      ctx.fillStyle = lineColor;
+      ctx.font      = `${isBOS ? "bold " : ""}11px Segoe UI`;
+      const tw      = ctx.measureText(labelText).width;
+      ctx.fillText(labelText, Math.max(padding.left + 2, midX - tw / 2), y - 5);
+    }
+  }
+
+  // ── 7b. Current active structure lines + Fibonacci retracement ───────────
+  // Only draw when at the live edge — these are current-structure levels, not historical.
+  if (state.offset === 0) {
+    const struct = state.activeStructure;
+    if (struct && Number.isFinite(struct.high) && Number.isFinite(struct.low) && struct.high > struct.low) {
+      const structRange = struct.high - struct.low;
+
+      // Structure high line (blue, dashed — level to watch for bullish break)
+      if (inPriceRange(struct.high, struct.high)) {
+        const xHigh = timeToX(struct.highTime, visible, padding, barSpacing);
+        const yHigh = priceToY(struct.high);
+        ctx.strokeStyle = "rgba(100,181,246,0.70)";
+        ctx.lineWidth   = 1.2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(xHigh, yHigh);
+        ctx.lineTo(width - padding.right, yHigh);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "rgba(100,181,246,0.80)";
+        ctx.font      = "10px Segoe UI";
+        ctx.fillText(`H ${formatPrice(struct.high)}`, width - padding.right + 3, yHigh - 3);
+      }
+
+      // Structure low line (blue, dashed — level to watch for bearish break)
+      if (inPriceRange(struct.low, struct.low)) {
+        const xLow = timeToX(struct.lowTime, visible, padding, barSpacing);
+        const yLow = priceToY(struct.low);
+        ctx.strokeStyle = "rgba(100,181,246,0.70)";
+        ctx.lineWidth   = 1.2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(xLow, yLow);
+        ctx.lineTo(width - padding.right, yLow);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "rgba(100,181,246,0.80)";
+        ctx.font      = "10px Segoe UI";
+        ctx.fillText(`L ${formatPrice(struct.low)}`, width - padding.right + 3, yLow + 10);
+      }
+
+      // Fibonacci retracement levels within the active structure range.
+      // dir=1 (bearish leg): fib measured from low → high (0.786 = deep premium, 0.382 = discount)
+      // dir=2 (bullish leg): fib measured from high → low (0.786 = deep discount, 0.382 = premium)
+      // Mirrors the Pine "Structure Fibonacci" calculation exactly.
+      const FIBS = [
+        { value: 0.786, color: "rgba(100,181,246,0.65)",  label: "0.786" },
+        { value: 0.705, color: "rgba(242,54,69,0.65)",    label: "0.705" },
+        { value: 0.618, color: "rgba(8,153,129,0.70)",    label: "0.618" },
+        { value: 0.500, color: "rgba(76,175,80,0.65)",    label: "0.5"   },
+        { value: 0.382, color: "rgba(129,199,132,0.65)",  label: "0.382" },
+      ];
+
+      ctx.lineWidth = 0.8;
+      ctx.font      = "9px Segoe UI";
+      for (const fib of FIBS) {
+        const fibPrice = struct.direction === 1
+          ? struct.low  + structRange * fib.value          // bearish leg: from low upward
+          : struct.low  + structRange * (1 - fib.value);   // bullish leg: from low, inverted
+        if (!inPriceRange(fibPrice, fibPrice)) continue;
+        const yFib = priceToY(fibPrice);
+        const xStart = Math.min(
+          timeToX(struct.direction === 1 ? struct.highTime : struct.lowTime, visible, padding, barSpacing),
+          width - padding.right
+        );
+        ctx.strokeStyle = fib.color;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(xStart, yFib);
+        ctx.lineTo(width - padding.right, yFib);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = fib.color;
+        ctx.textAlign = "right";
+        ctx.fillText(`${fib.label} (${formatPrice(fibPrice)})`, width - padding.right - 6, yFib + 3);
+        ctx.textAlign = "left";
+      }
+      ctx.setLineDash([]);
+    }
+  } // end live-edge structure+fib block
+
+  // ── 8. EMA lines ─────────────────────────────────────────────────────────
+  for (const period of (overlays.emas || [])) {
+    const series = state.emaValues?.[period];
+    if (!series || series.length < 2) continue;
+    const slice = series.slice(sliceStart, sliceEnd);
+    const style = EMA_STYLE[period];
+    ctx.strokeStyle = style.color;
+    ctx.lineWidth   = style.width;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    let started = false;
+    slice.forEach((val, i) => {
+      if (val == null || !Number.isFinite(val)) { started = false; return; }
+      if (!inPriceRange(val, val)) { started = false; return; }
+      const x = padding.left + i * barSpacing + barSpacing / 2;
+      const y = priceToY(val);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    // Label only at live edge — when scrolled back these stack up and clutter the y-axis
+    if (state.offset === 0) {
+      const lastVal = [...slice].reverse().find(v => v != null && Number.isFinite(v));
+      if (lastVal != null && inPriceRange(lastVal, lastVal)) {
+        ctx.fillStyle = style.color;
+        ctx.font = "10px Segoe UI";
+        ctx.fillText(style.label, width - padding.right + 4, priceToY(lastVal) + 4);
+      }
+    }
+  }
+
+  // ── 9. VWAP (LTF only) ───────────────────────────────────────────────────
+  if (overlays.vwap && state.vwapValues?.length) {
+    const slice = state.vwapValues.slice(sliceStart, sliceEnd);
+    ctx.strokeStyle = "rgba(125,211,252,0.75)";
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    let started = false;
+    slice.forEach((val, i) => {
+      if (!Number.isFinite(val)) { started = false; return; }
+      if (!inPriceRange(val, val)) { started = false; return; }
+      const x = padding.left + i * barSpacing + barSpacing / 2;
+      const y = priceToY(val);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (state.offset === 0) {
+      const lastVwap = [...slice].reverse().find(v => Number.isFinite(v));
+      if (lastVwap != null && inPriceRange(lastVwap, lastVwap)) {
+        ctx.fillStyle = "rgba(125,211,252,0.85)";
+        ctx.font = "10px Segoe UI";
+        ctx.fillText("VWAP", width - padding.right + 4, priceToY(lastVwap) + 4);
+      }
+    }
+  }
+
+  // ── 10. Price axis ────────────────────────────────────────────────────────
+  ctx.fillStyle = "rgba(154,176,211,0.90)";
+  ctx.font = "11px Segoe UI";
+  for (let row = 0; row <= 5; row++) {
     const price = maxPrice - (range / 5) * row;
     const y = padding.top + (chartHeight / 5) * row;
     ctx.fillText(formatPrice(price), width - padding.right + 10, y + 4);
   }
 
+  // ── 11. Time axis ────────────────────────────────────────────────────────
   const labelIndexes = [0, Math.floor(visible.length * 0.25), Math.floor(visible.length * 0.5), Math.floor(visible.length * 0.75), visible.length - 1];
+  ctx.fillStyle = "rgba(154,176,211,0.90)";
+  ctx.font = "11px Segoe UI";
   for (const index of labelIndexes) {
     const candle = visible[index];
     if (!candle) continue;
     const x = padding.left + index * barSpacing;
-    const previousCandle = index > 0 ? visible[index - 1] : null;
-    ctx.fillText(formatAxisLabel(candle.time, previousCandle?.time ?? null), x, height - 14);
+    const prev = index > 0 ? visible[index - 1] : null;
+    ctx.fillText(formatAxisLabel(candle.time, prev?.time ?? null), x, height - 14);
   }
 
+  // ── 12. Hover crosshair ──────────────────────────────────────────────────
   const hoveredIndex = state.hoverIndex;
   if (hoveredIndex != null && visible[hoveredIndex]) {
-    const candle = visible[hoveredIndex];
+    const candle  = visible[hoveredIndex];
     const centerX = padding.left + hoveredIndex * barSpacing + barSpacing / 2;
-    const closeY = priceToY(Number(candle.close));
-    ctx.strokeStyle = "rgba(125, 211, 252, 0.7)";
+    const closeY  = priceToY(Number(candle.close));
+    ctx.strokeStyle = "rgba(125,211,252,0.65)";
     ctx.lineWidth = 1;
     ctx.setLineDash([6, 4]);
-    ctx.beginPath();
-    ctx.moveTo(centerX, padding.top);
-    ctx.lineTo(centerX, height - padding.bottom);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(padding.left, closeY);
-    ctx.lineTo(width - padding.right, closeY);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(centerX, padding.top); ctx.lineTo(centerX, height - padding.bottom); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padding.left, closeY); ctx.lineTo(width - padding.right, closeY); ctx.stroke();
     ctx.setLineDash([]);
     const hoverText = `${formatDisplayTimestamp(candle.time)}  O ${formatPrice(candle.open)}  H ${formatPrice(candle.high)}  L ${formatPrice(candle.low)}  C ${formatPrice(candle.close)}  V ${Number(candle.tick_volume ?? 0).toLocaleString()}`;
-    ctx.fillStyle = "rgba(10, 18, 30, 0.92)";
+    ctx.fillStyle = "rgba(10,18,30,0.92)";
     ctx.fillRect(18, 10, Math.min(620, width - 36), 26);
     ctx.fillStyle = "#edf4ff";
     ctx.font = "12px Segoe UI";
@@ -2724,7 +2637,6 @@ function drawChart(timeframe) {
 function renderBoard() {
   renderTradeOverview();
   for (const timeframe of TIMEFRAMES) {
-    const state = chartState[timeframe];
     updateCardMeta(timeframe);
     drawChart(timeframe);
   }
@@ -2774,15 +2686,18 @@ function applyLiveTickToCharts(tickPayload) {
 async function loadBoard() {
   const symbol = String(symbolInput.value || "XAUUSD").trim().toUpperCase() || "XAUUSD";
   const limitRaw = String(limitInput.value || "ALL").trim().toUpperCase() || "ALL";
-  const limit = limitRaw === "ALL" ? "ALL" : String(Math.max(80, Math.min(99999, Number(limitRaw || 99999))));
+  // If the user typed a specific limit, honour it globally.
+  // Otherwise fall back to the per-TF context-appropriate default from TIMEFRAME_DEFAULT_BARS.
+  const globalLimitOverride = limitRaw === "ALL" ? null : Math.max(80, Math.min(99999, Number(limitRaw || 99999)));
   refreshButton.disabled = true;
   bridgeStatus.textContent = "Syncing";
   activeSymbolLabel.textContent = symbol;
   try {
     let loadedCount = 0;
     for (const timeframe of TIMEFRAMES) {
+      const tfLimit = globalLimitOverride !== null ? globalLimitOverride : (TIMEFRAME_DEFAULT_BARS[timeframe] ?? 200);
       const response = await fetch(
-        `/api/timeframe?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${encodeURIComponent(limit)}`,
+        `/api/timeframe?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${encodeURIComponent(tfLimit)}`,
         { cache: "no-store" }
       );
       const payload = await response.json();
@@ -3029,7 +2944,7 @@ function bindChartInteractions(timeframe) {
     const rect = canvas.getBoundingClientRect();
     const visible = getVisibleCandles(state);
     if (!visible.length) return;
-    const geometry = getChartGeometry(canvas, visible.length);
+    const geometry = getChartGeometry(canvas, visible.length, state.offset === 0);
 
     if (state.dragging) {
       event.preventDefault();
