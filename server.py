@@ -20,6 +20,9 @@ import MetaTrader5 as mt5
 HOST = "127.0.0.1"
 PORT = 8090
 ROOT = Path(__file__).resolve().parent
+NEURAL_APP_ROOT = ROOT / "neural_website_repo"
+NEURAL_APP_DIST = NEURAL_APP_ROOT / "dist"
+FRONTEND_ROOT = NEURAL_APP_DIST if NEURAL_APP_DIST.exists() else ROOT
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
 MARKET_TIMEZONE = timezone.utc
 BROKER_OFFSET_FALLBACK_SECONDS = 3 * 60 * 60
@@ -47,7 +50,7 @@ DEFAULT_NEWS_BLOCK_AFTER_MINUTES = 20
 MANUAL_NEWS_BLOCK_MINUTES = 45
 AUTOTRADE_STATE = {
     "enabled": False,
-    "lot": 0.01,
+    "lot": 0.10,
     "last_signal_id": "",
     "last_attempt_at": 0.0,
     "last_trade_at": 0.0,
@@ -58,7 +61,7 @@ AUTOTRADE_STATE = {
 }
 AUTOTRADE_LOCK = threading.RLock()
 MT5_LOCK = threading.Lock()
-AUTOTRADE_COOLDOWN_SECONDS = 15 * 60
+AUTOTRADE_COOLDOWN_SECONDS = 0
 DEAL_ENTRY_OUT = getattr(mt5, "DEAL_ENTRY_OUT", 1)
 DEAL_ENTRY_OUT_BY = getattr(mt5, "DEAL_ENTRY_OUT_BY", 3)
 DEAL_ENTRY_INOUT = getattr(mt5, "DEAL_ENTRY_INOUT", 2)
@@ -74,8 +77,9 @@ AUTONOMOUS_AI_MODEL = os.environ.get("AUTONOMOUS_AI_MODEL", OLLAMA_DEFAULT_MODEL
 AUTONOMOUS_AI_INTERVAL_SECONDS = 5 * 60
 GOOGLE_SHEET_SYNC_INTERVAL_SECONDS = 60
 AUTONOMOUS_AI_CONTEXT_BARS = 240
+AUTONOMOUS_AI_ENABLED_BY_DEFAULT = os.environ.get("AUTONOMOUS_AI_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 AUTONOMOUS_AI_STATE = {
-    "enabled": True,
+    "enabled": AUTONOMOUS_AI_ENABLED_BY_DEFAULT,
     "symbol": AUTONOMOUS_AI_SYMBOL,
     "model": AUTONOMOUS_AI_MODEL,
     "last_run_at": "",
@@ -2008,6 +2012,46 @@ def detect_fvg_entry(
     return {"passed": passed, "detail": detail}
 
 
+def compute_bollinger_band(
+    candles: list[dict[str, float | int]],
+    *,
+    period: int,
+    std_dev: float,
+    source: str,
+    offset: int = 0,
+) -> dict[str, float] | None:
+    end = len(candles) - int(offset or 0)
+    start = end - period
+    if start < 0 or end <= start:
+        return None
+    values = [float(candle[source]) for candle in candles[start:end]]
+    if len(values) != period:
+        return None
+    basis = sum(values) / period
+    variance = sum((v - basis) ** 2 for v in values) / period
+    deviation = variance ** 0.5
+    upper = basis + deviation * std_dev
+    lower = basis - deviation * std_dev
+    return {
+        "basis": round(basis, 2),
+        "upper": round(upper, 2),
+        "lower": round(lower, 2),
+        "width": round(upper - lower, 2),
+    }
+
+
+def build_rr_targets(entry: float, sl: float, side: str, setup_type: str, rr_1: float = 3.0, rr_2: float = 4.5) -> tuple[float | None, float | None]:
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None, None
+    tp1_raw = entry + risk * rr_1 if side == "buy" else entry - risk * rr_1
+    tp2_raw = entry + risk * rr_2 if side == "buy" else entry - risk * rr_2
+    return (
+        clamp_target_by_setup(entry, tp1_raw, side, setup_type),
+        clamp_target_by_setup(entry, tp2_raw, side, setup_type),
+    )
+
+
 def build_trade_payload(
     *,
     board: dict[str, object],
@@ -2116,534 +2160,225 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
             entry_checks={"market_open": False},
             smc_parameters={},
         )
-    bias = infer_board_bias(board)
+    m15 = get_frame(board, "M15")
+    m15_bias = classify_frame_bias(m15)
+    bias = m15_bias if m15_bias in {"bullish", "bearish"} else "mixed"
     market_phase = infer_board_phase(board, bias)
     location = infer_setup_location(board)
-    ltf_tone = infer_ltf_tone(board)
 
-    h1 = get_frame(board, "H1")
-    m15 = get_frame(board, "M15")
-    m5 = get_frame(board, "M5")
-    h1_levels = h1.get("levels") if isinstance(h1.get("levels"), dict) else {}
-    m15_levels = m15.get("levels") if isinstance(m15.get("levels"), dict) else {}
-    m5_levels = m5.get("levels") if isinstance(m5.get("levels"), dict) else {}
-    h1_structure  = h1.get("structureMap")  if isinstance(h1.get("structureMap"),  dict) else {}
-    m15_structure = m15.get("structureMap") if isinstance(m15.get("structureMap"), dict) else {}
-    m5_atr = ((m5.get("volatility") if isinstance(m5.get("volatility"), dict) else {}) or {}).get("atr")
-    atr_value = float(m5_atr) if m5_atr is not None else (calculate_atr(m5.get("candles") if isinstance(m5.get("candles"), list) else []) or 6.0)
-    buffer = max(atr_value * 0.25, 0.8)
-
-    # --- SMC: Order Block and FVG detection on M5 + M15 candles ---
-    # Use a longer lookback window (80 bars) to find structural OBs and FVGs.
-    # M15 first (watch zone / structural setup), then M5 (entry confirmation precision).
-    m5_all_candles = m5.get("candles") if isinstance(m5.get("candles"), list) else []
-    m15_all_candles = m15.get("candles") if isinstance(m15.get("candles"), list) else []
-    m5_bull_obs  = detect_order_blocks(m5_all_candles,  "buy",  atr_value=atr_value)
-    m5_bear_obs  = detect_order_blocks(m5_all_candles,  "sell", atr_value=atr_value)
-    m15_bull_obs = detect_order_blocks(m15_all_candles, "buy",  atr_value=atr_value)
-    m15_bear_obs = detect_order_blocks(m15_all_candles, "sell", atr_value=atr_value)
-    # Nearest unmitigated bullish OB below price — M15 watch zone takes priority over M5
-    nearest_bull_ob = next(
-        (ob for ob in m15_bull_obs + m5_bull_obs if float(ob["high"]) < current_price),
-        None,
-    )
-    # Nearest unmitigated bearish OB above price — M15 watch zone takes priority over M5
-    nearest_bear_ob = next(
-        (ob for ob in m15_bear_obs + m5_bear_obs if float(ob["low"]) > current_price),
-        None,
-    )
-    m5_bull_fvgs  = detect_fvg(m5_all_candles,  "buy")
-    m5_bear_fvgs  = detect_fvg(m5_all_candles,  "sell")
-    m15_bull_fvgs = detect_fvg(m15_all_candles, "buy")
-    m15_bear_fvgs = detect_fvg(m15_all_candles, "sell")
-    # Nearest unfilled bullish FVG below price — M15 watch zone takes priority over M5
-    nearest_bull_fvg = next(
-        (fvg for fvg in m15_bull_fvgs + m5_bull_fvgs if float(fvg["high"]) < current_price),
-        None,
-    )
-    # Nearest unfilled bearish FVG above price — M15 watch zone takes priority over M5
-    nearest_bear_fvg = next(
-        (fvg for fvg in m15_bear_fvgs + m5_bear_fvgs if float(fvg["low"]) > current_price),
-        None,
-    )
-    # ----------------------------------------------------------------
-
-    # H4 is included in the target pool so TP can reach structural H4 levels.
-    # H4 is intentionally excluded from near_*_candidates so the entry zone stays M5/M15-precise.
-    # OB and FVG levels are also injected here:
-    #   — nearest_bull_ob.high / nearest_bull_fvg.midpoint → near-entry support candidates
-    #   — nearest_bear_ob.low / nearest_bear_fvg.midpoint  → resistance/TP candidates
-    support_candidates = [m5_levels.get("support"), m15_levels.get("support"), h1_levels.get("support"), m15_structure.get("structureLow"), h1_structure.get("structureLow")]
-    resistance_candidates = [m5_levels.get("resistance"), m15_levels.get("resistance"), h1_levels.get("resistance"), m15_structure.get("structureHigh"), h1_structure.get("structureHigh")]
-    # Add OB midpoints and FVG midpoints to TP pool
-    if nearest_bear_ob:
-        resistance_candidates.append(nearest_bear_ob["midpoint"])
-    if nearest_bear_fvg:
-        resistance_candidates.append(nearest_bear_fvg["midpoint"])
-    if nearest_bull_ob:
-        support_candidates.append(nearest_bull_ob["midpoint"])
-    if nearest_bull_fvg:
-        support_candidates.append(nearest_bull_fvg["midpoint"])
-    fresh_m5_support = recent_fresh_structure_level("buy", m5_all_candles, current_price)
-    fresh_m5_resistance = recent_fresh_structure_level("sell", m5_all_candles, current_price)
-    # OB high (body top) is a precise near-entry support level for buys
-    ob_near_support = float(nearest_bull_ob["high"]) if nearest_bull_ob else None
-    ob_near_resistance = float(nearest_bear_ob["low"]) if nearest_bear_ob else None
-    near_support_candidates = [ob_near_support, fresh_m5_support, m5_levels.get("support"), m15_levels.get("support"), h1_levels.get("support"), m15_structure.get("buyZoneLow"), m15_structure.get("buyZoneHigh")]
-    near_resistance_candidates = [ob_near_resistance, fresh_m5_resistance, m5_levels.get("resistance"), m15_levels.get("resistance"), h1_levels.get("resistance"), m15_structure.get("sellZoneLow"), m15_structure.get("sellZoneHigh")]
-    support_zone = [float(value) for value in support_candidates if value is not None]
-    resistance_zone = [float(value) for value in resistance_candidates if value is not None]
-    near_support_zone = [float(value) for value in near_support_candidates if value is not None]
-    near_resistance_zone = [float(value) for value in near_resistance_candidates if value is not None]
-    # Watch zone = OTE zone (where the entry gate actually fires), not the broader fib382–equilibrium band.
-    # OTE is directional: direction=2 → discount OTE is the buy zone; direction=1 → premium OTE is the sell zone.
-    m15_struct_dir = int(m15_structure.get("structureDirection") or 0)
-    ote_low_val  = m15_structure.get("oteLow")
-    ote_high_val = m15_structure.get("oteHigh")
-    if m15_struct_dir == 2 and ote_low_val is not None and ote_high_val is not None:
-        pullback_buy_zone = f"{float(ote_low_val):.2f}-{float(ote_high_val):.2f}"
-    else:
-        pullback_buy_zone = build_zone_text(near_support_zone, current_price, "buy", atr_value) if near_support_zone else (build_zone_text(support_zone, current_price, "buy", atr_value) if support_zone else "No clear support zone")
-    if m15_struct_dir == 1 and ote_low_val is not None and ote_high_val is not None:
-        rally_sell_zone = f"{float(ote_low_val):.2f}-{float(ote_high_val):.2f}"
-    else:
-        rally_sell_zone = build_zone_text(near_resistance_zone, current_price, "sell", atr_value) if near_resistance_zone else (build_zone_text(resistance_zone, current_price, "sell", atr_value) if resistance_zone else "No clear resistance zone")
-
-    pd_position = str(m15_structure.get("rangePosition", "middle") or "middle").strip().lower()
-    smc_parameters = {
-        "h1Bias": bias,
-        "m15Phase": market_phase,
-        "m15StructureHigh": m15_structure.get("structureHigh"),
-        "m15StructureLow": m15_structure.get("structureLow"),
-        "m15Equilibrium": m15_structure.get("equilibrium"),
-        "m15PdPosition": pd_position,
-        "m15DiscountZone": f"{float(m15_structure['discountLow']):.2f}-{float(m15_structure['discountHigh']):.2f}" if m15_structure.get("discountLow") is not None and m15_structure.get("discountHigh") is not None else "--",
-        "m15PremiumZone": f"{float(m15_structure['premiumLow']):.2f}-{float(m15_structure['premiumHigh']):.2f}" if m15_structure.get("premiumLow") is not None and m15_structure.get("premiumHigh") is not None else "--",
-        "buyExecutionZone": pullback_buy_zone,
-        "sellExecutionZone": rally_sell_zone,
-        "activePrice": round(current_price, 2),
-        "ltfTone": ltf_tone,
-    }
-    # Dedicated OB and FVG zone texts (exact body bounds, no ATR-width approximation)
-    ob_buy_zone   = f"{nearest_bull_ob['low']:.2f}-{nearest_bull_ob['high']:.2f}"  if nearest_bull_ob  else pullback_buy_zone
-    ob_sell_zone  = f"{nearest_bear_ob['low']:.2f}-{nearest_bear_ob['high']:.2f}"  if nearest_bear_ob  else rally_sell_zone
-    fvg_buy_zone  = f"{nearest_bull_fvg['low']:.2f}-{nearest_bull_fvg['high']:.2f}" if nearest_bull_fvg else pullback_buy_zone
-    fvg_sell_zone = f"{nearest_bear_fvg['low']:.2f}-{nearest_bear_fvg['high']:.2f}" if nearest_bear_fvg else rally_sell_zone
-
-    why: list[str] = []
-    conflicts: list[str] = []
-    location_note = ""
-
-    if bias == "bullish":
-        why.append("H1 context is bullish and M15 confirms the structure")
-    elif bias == "bearish":
-        why.append("H1 context is bearish and M15 confirms the structure")
-    else:
-        conflicts.append("H1 context and M15 structure are not aligned")
-
-    if location == "resistance":
-        location_note = "Price is pressing into upper structure / resistance"
-    elif location == "support":
-        location_note = "Price is near support / pullback value"
-    else:
-        location_note = "Price is in the middle of structure"
-
-    if ltf_tone == "bullish":
-        why.append("M5/M1 is stabilizing after the pullback")
-    elif ltf_tone == "bearish":
-        why.append("M5/M1 is leaning lower short term")
-    else:
-        conflicts.append("M5/M1 timing is mixed")
-
-    if location_note:
-        if location == "middle":
-            conflicts.append(location_note)
-        else:
-            why.append(location_note)
-
-    m5_candles = recent_candles(m5, 10)
-    m1_candles = recent_candles(get_frame(board, "M1"), 8)
-    nearest_support = max([value for value in support_zone if value <= current_price], default=(min(support_zone) if support_zone else None))
-    nearest_resistance = min([value for value in resistance_zone if value >= current_price], default=(max(resistance_zone) if resistance_zone else None))
-    buy_zone_ok = price_within_entry_tolerance(
-        price=current_price,
-        side="buy",
-        zone_text=pullback_buy_zone,
-        atr_value=atr_value,
-        location_label="support" if str(m15_structure.get("rangePosition", "") or "").lower() == "discount" else "middle",
-    )
-    sell_zone_ok = price_within_entry_tolerance(
-        price=current_price,
-        side="sell",
-        zone_text=rally_sell_zone,
-        atr_value=atr_value,
-        location_label="resistance" if str(m15_structure.get("rangePosition", "") or "").lower() == "premium" else "middle",
-    )
-    buy_confirmation_ok = has_entry_confirmation(side="buy", m5_candles=m5_candles, m1_candles=m1_candles)
-    sell_confirmation_ok = has_entry_confirmation(side="sell", m5_candles=m5_candles, m1_candles=m1_candles)
-
-    signal_reviews: list[dict[str, object]] = []
-
-    def evaluate_smc_signal(
-        side: str,
-        signal_name: str,
-        detector: dict[str, object],
-        reason_text: str,
-        zone_text: str,
-        location_label: str,
-    ) -> dict[str, object] | None:
-        passed = bool(detector.get("passed"))
-        trigger_detail = str(detector.get("detail", "") or "Pattern confirmed")
-        zone_ok = passed and price_within_entry_tolerance(
-            price=current_price,
-            side=side,
-            zone_text=zone_text,
-            atr_value=atr_value,
-            location_label=location_label,
-        )
-        confirmation_ok = passed and has_entry_confirmation(side=side, m5_candles=m5_candles, m1_candles=m1_candles)
-        review = {
-            "setup_type": "smc_buy" if side == "buy" else "smc_sell",
-            "side": side,
-            "signal": signal_name,
-            "passed": passed,
-            "zone_ok": zone_ok,
-            "confirmation_ok": confirmation_ok,
-            "zone": zone_text,
-            "trigger": trigger_detail,
-            "rr": 0.0,
-        }
-        # OTE gate — OB/FVG retests must sit inside the M5 OTE zone (0.618–0.786 retracement).
-        # Sweeps, breakouts, and BOS retests skip this check — they have their own structural context.
-        ote_signals = {"bullish_ob_retest", "bullish_fvg_retest", "bearish_ob_retest", "bearish_fvg_retest"}
-        if passed and signal_name in ote_signals:
-            ote_low  = m15_structure.get("oteLow")
-            ote_high = m15_structure.get("oteHigh")
-            if ote_low is not None and ote_high is not None:
-                in_ote = float(ote_low) <= current_price <= float(ote_high)
-                review["ote_ok"] = in_ote
-                if not in_ote:
-                    signal_reviews.append(review)
-                    return None
-            else:
-                review["ote_ok"] = True
-        else:
-            review["ote_ok"] = True
-
-        signal_reviews.append(review)
-        if not passed or not zone_ok or not confirmation_ok:
-            return None
-
-        entry = round(current_price, 2)
-        matched_ob  = None
-        matched_fvg = None
-        # OTE edges — SL sits just outside the OTE zone (below oteLow for buys, above oteHigh for sells).
-        # If price breaks back through the 0.786 retracement the OTE setup is void.
-        m5_sl_anchor_buy  = m15_structure.get("oteLow")
-        m5_sl_anchor_sell = m15_structure.get("oteHigh")
-        if side == "buy":
-            if zone_text == ob_buy_zone and nearest_bull_ob:
-                matched_ob = nearest_bull_ob
-            if zone_text == fvg_buy_zone and nearest_bull_fvg:
-                matched_fvg = nearest_bull_fvg
-            sl = smc_structural_stop(
-                side="buy",
-                setup_type="smc_buy",
-                entry=entry,
-                m5_candles=m5_candles,
-                buffer=buffer,
-                atr_value=atr_value,
-                support_level=nearest_support,
-                resistance_level=nearest_resistance,
-                ob=matched_ob,
-                fvg=matched_fvg,
-                structure_level=float(m5_sl_anchor_buy) if m5_sl_anchor_buy is not None else None,
-            )
-            sl = clamp_stop_distance(entry, sl, "buy", "smc_buy")
-            # TP: nearest M15 fib level above entry — trades only to the next zone, not the full structure top.
-            fib_ladder_buy = [
-                m15_structure.get("fib382"),        # 38.2% of range
-                m15_structure.get("equilibrium"),   # 50%
-                m15_structure.get("fib618"),        # 61.8%
-                m15_structure.get("sellExtremeHigh"), # 70.5%
-                m15_structure.get("fib786"),        # 78.6%
-                m15_structure.get("structureHigh"), # 100%
-            ]
-            tp_pool = [float(v) for v in fib_ladder_buy if v is not None]
-            tp1, tp2 = choose_smc_targets(
-                entry=entry,
-                side="buy",
-                setup_type="smc_buy",
-                target_candidates=tp_pool,
-                risk_distance=abs(entry - sl),
-            )
-        else:
-            if zone_text == ob_sell_zone and nearest_bear_ob:
-                matched_ob = nearest_bear_ob
-            if zone_text == fvg_sell_zone and nearest_bear_fvg:
-                matched_fvg = nearest_bear_fvg
-            sl = smc_structural_stop(
-                side="sell",
-                setup_type="smc_sell",
-                entry=entry,
-                m5_candles=m5_candles,
-                buffer=buffer,
-                atr_value=atr_value,
-                support_level=nearest_support,
-                resistance_level=nearest_resistance,
-                ob=matched_ob,
-                fvg=matched_fvg,
-                structure_level=float(m5_sl_anchor_sell) if m5_sl_anchor_sell is not None else None,
-            )
-            sl = clamp_stop_distance(entry, sl, "sell", "smc_sell")
-            # TP: nearest M15 fib level below entry — trades only to the next zone, not the full structure bottom.
-            fib_ladder_sell = [
-                m15_structure.get("fib786"),        # 78.6%
-                m15_structure.get("sellExtremeHigh"), # 70.5%
-                m15_structure.get("fib618"),        # 61.8%
-                m15_structure.get("equilibrium"),   # 50%
-                m15_structure.get("fib382"),        # 38.2%
-                m15_structure.get("structureLow"),  # 0%
-            ]
-            tp_pool = [float(v) for v in fib_ladder_sell if v is not None]
-            tp1, tp2 = choose_smc_targets(
-                entry=entry,
-                side="sell",
-                setup_type="smc_sell",
-                target_candidates=tp_pool,
-                risk_distance=abs(entry - sl),
-            )
-
-        if not entry_matches_setup_zone(entry=entry, side=side, setup_type=("smc_buy" if side == "buy" else "smc_sell"), zone_text=zone_text, atr_value=atr_value):
-            review["entry_ok"] = False
-            return None
-
-        review["entry_ok"] = True
-        rr = round(abs(tp1 - entry) / abs(entry - sl), 2) if tp1 is not None and entry != sl else 0.0
-        review["rr"] = rr
-        return {
-            "side": side,
-            "setup_type": "smc_buy" if side == "buy" else "smc_sell",
-            "signal": signal_name,
-            "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "rr": rr,
-            "zone_text": zone_text,
-            "reason": reason_text,
-            "trigger": trigger_detail,
-            "location_label": location_label,
-        }
-
-    chosen_trade = None
-    active_signal = None
-
-    if bias == "bullish":
-        bullish_signal_stack = [
-            # OB/FVG retests first — cleanest SMC entry (institutional origin / imbalance)
-            ("bullish_ob_retest", detect_ob_entry("buy", nearest_bull_ob, m5_candles, m1_candles) if nearest_bull_ob else {"passed": False, "detail": "No valid bullish OB"}, f"Price is reacting from bullish OB at {ob_buy_zone}." if nearest_bull_ob else "No bullish OB in range.", ob_buy_zone, "support"),
-            ("bullish_fvg_retest", detect_fvg_entry("buy", nearest_bull_fvg, m5_candles, m1_candles) if nearest_bull_fvg else {"passed": False, "detail": "No valid bullish FVG"}, f"Bullish FVG retest at {fvg_buy_zone} is reacting." if nearest_bull_fvg else "No bullish FVG in range.", fvg_buy_zone, "support"),
-            # Liquidity sweep and failed-break setups — strong context but less precise entry
-            ("sell_side_sweep_reclaim", detect_liquidity_sweep_reversal("buy", nearest_support, m5_candles, m1_candles), "Sell-side liquidity was swept and price reclaimed support.", pullback_buy_zone, "support"),
-            ("failed_breakdown_reclaim", detect_failed_break("buy", nearest_support, m5_candles, m1_candles), "Support was swept and reclaimed with bullish timing.", pullback_buy_zone, "support"),
-            ("bullish_bos_retest", detect_retest_hold("buy", nearest_resistance, m5_candles, m1_candles), f"Resistance broke and is holding as support near {nearest_resistance:.2f}." if nearest_resistance is not None else "No bullish BOS retest.", f"Retest around {nearest_resistance:.2f}" if nearest_resistance is not None else "Retest zone", "breakout_zone"),
-            ("bullish_displacement", detect_strong_breakout_impulse("buy", nearest_resistance, m5_candles, m1_candles), f"Bullish displacement is continuing above {nearest_resistance:.2f}." if nearest_resistance is not None else "No bullish displacement.", f"Above {nearest_resistance:.2f}" if nearest_resistance is not None else "Above breakout", "breakout_zone"),
-        ]
-        for signal_name, detector, reason_text, zone_text, location_label in bullish_signal_stack:
-            if active_signal is None and detector.get("passed"):
-                active_signal = {
-                    "signal": signal_name,
-                    "reason": reason_text,
-                    "trigger": str(detector.get("detail", "") or ""),
-                    "zone_text": zone_text,
-                }
-            chosen_trade = evaluate_smc_signal("buy", signal_name, detector, reason_text, zone_text, location_label)
-            if chosen_trade is not None:
-                break
-
-    if bias == "bearish" and chosen_trade is None:
-        bearish_signal_stack = [
-            # OB/FVG retests first — cleanest SMC entry (institutional origin / imbalance)
-            ("bearish_ob_retest", detect_ob_entry("sell", nearest_bear_ob, m5_candles, m1_candles) if nearest_bear_ob else {"passed": False, "detail": "No valid bearish OB"}, f"Price is reacting from bearish OB at {ob_sell_zone}." if nearest_bear_ob else "No bearish OB in range.", ob_sell_zone, "resistance"),
-            ("bearish_fvg_retest", detect_fvg_entry("sell", nearest_bear_fvg, m5_candles, m1_candles) if nearest_bear_fvg else {"passed": False, "detail": "No valid bearish FVG"}, f"Bearish FVG retest at {fvg_sell_zone} is reacting." if nearest_bear_fvg else "No bearish FVG in range.", fvg_sell_zone, "resistance"),
-            # Liquidity sweep and failed-break setups — strong context but less precise entry
-            ("buy_side_sweep_reject", detect_liquidity_sweep_reversal("sell", nearest_resistance, m5_candles, m1_candles), "Buy-side liquidity was swept and rejected from resistance.", rally_sell_zone, "resistance"),
-            ("failed_breakout_reject", detect_failed_break("sell", nearest_resistance, m5_candles, m1_candles), "Resistance was swept and rejected with bearish timing.", rally_sell_zone, "resistance"),
-            ("bearish_bos_retest", detect_retest_hold("sell", nearest_support, m5_candles, m1_candles), f"Support broke and is failing from below near {nearest_support:.2f}." if nearest_support is not None else "No bearish BOS retest.", f"Retest around {nearest_support:.2f}" if nearest_support is not None else "Retest zone", "breakdown_zone"),
-            ("bearish_displacement", detect_strong_breakout_impulse("sell", nearest_support, m5_candles, m1_candles), f"Bearish displacement is continuing below {nearest_support:.2f}." if nearest_support is not None else "No bearish displacement.", f"Below {nearest_support:.2f}" if nearest_support is not None else "Below breakdown", "breakdown_zone"),
-        ]
-        for signal_name, detector, reason_text, zone_text, location_label in bearish_signal_stack:
-            if active_signal is None and detector.get("passed"):
-                active_signal = {
-                    "signal": signal_name,
-                    "reason": reason_text,
-                    "trigger": str(detector.get("detail", "") or ""),
-                    "zone_text": zone_text,
-                }
-            chosen_trade = evaluate_smc_signal("sell", signal_name, detector, reason_text, zone_text, location_label)
-            if chosen_trade is not None:
-                break
-
-    compact_candidates = [
-        {
-            "setup_type": str(item.get("setup_type", "") or ""),
-            "side": str(item.get("side", "") or ""),
-            "score": 100.0 if item.get("passed") and item.get("zone_ok") and item.get("confirmation_ok") else (70.0 if item.get("passed") else 0.0),
-            "rr": round(float(item.get("rr") or 0.0), 2),
-            "zone": str(item.get("zone", "") or ""),
-            "trigger": str(item.get("trigger", "") or ""),
-        }
-        for item in signal_reviews[:6]
-    ]
-
-    def build_wait_requirements(*, bias: str, active_signal: dict[str, object] | None, zone_ok: bool, confirmation_ok: bool, location: str) -> list[str]:
-        items: list[str] = []
-        if active_signal is None:
-            items.append("Valid M15 SMC structure")
-        else:
-            signal_name = str(active_signal.get("signal", "") or "").replace("_", " ").strip()
-            items.append(f"M5 trigger for {signal_name}" if signal_name else "Cleaner M5 trigger")
-        if not zone_ok:
-            if location == "support":
-                items.append("Price back into bullish PD / discount zone")
-            elif location == "resistance":
-                items.append("Price back into bearish PD / premium zone")
-            else:
-                items.append("Better M15 dealing location")
-        if not confirmation_ok:
-            items.append("Cleaner M5/M1 confirmation candle")
-        if bias == "mixed":
-            items.append("Clearer H1 and M15 alignment")
-        return items[:4] if items else ["Cleaner M15 structure", "Better M15 dealing location", "Cleaner M5/M1 trigger"]
-
-    if chosen_trade is not None:
+    # DBB strategy runs on M15 candles (period=20, 1SD inner, 2SD outer)
+    m15_candles = recent_candles(m15, 60)
+    if len(m15_candles) < 22:
         return build_trade_payload(
             board=board,
-            side=str(chosen_trade["side"]),
+            side="none",
+            market_phase="building",
+            bias="mixed",
+            setup_type="none",
+            location="waiting",
+            zone_text="Need more M15 data",
+            reason="Not enough M15 candles to compute the 20-period DBB bands yet.",
+            why=["DBB needs at least 21 M15 candles to initialise"],
+            conflicts=["Insufficient M15 candle history"],
+            trigger_text="Waiting for more candle data.",
+            execution_plan="Wait for the chart to build enough M15 history before trading.",
+            entry=None,
+            sl=None,
+            tp1=None,
+            tp2=None,
+            model=CURRENT_STRATEGY_MODEL,
+            pattern_candidates=[],
+            entry_checks={"market_open": True, "enough_data": False},
+            smc_parameters={},
+        )
+
+    m15_atr = ((m15.get("volatility") if isinstance(m15.get("volatility"), dict) else {}) or {}).get("atr")
+    atr_value = float(m15_atr) if m15_atr is not None else (calculate_atr(m15_candles) or 6.0)
+    buffer = max(atr_value * 0.18, 0.6)
+
+    # Current and previous bar BB values
+    bb_now  = compute_bollinger_band(m15_candles, period=20, std_dev=1.0, source="close")
+    bb_prev = compute_bollinger_band(m15_candles, period=20, std_dev=1.0, source="close", offset=1)
+    bb2_now = compute_bollinger_band(m15_candles, period=20, std_dev=2.0, source="close")
+
+    if bb_now is None or bb_prev is None or bb2_now is None:
+        return build_trade_payload(
+            board=board,
+            side="none",
+            market_phase="building",
+            bias=bias,
+            setup_type="none",
+            location="waiting",
+            zone_text="Need indicator history",
+            reason="DBB bands are not fully initialised yet.",
+            why=["Need 20-period SMA with 1SD and 2SD on M15"],
+            conflicts=["Indicator history incomplete"],
+            trigger_text="Waiting for DBB setup.",
+            execution_plan="Wait for the indicator window to initialise before trading.",
+            entry=None,
+            sl=None,
+            tp1=None,
+            tp2=None,
+            model=CURRENT_STRATEGY_MODEL,
+            pattern_candidates=[],
+            entry_checks={"market_open": True, "enough_data": False},
+            smc_parameters={},
+        )
+
+    last = m15_candles[-1]
+    prev = m15_candles[-2]
+    last_close = float(last["close"])
+    last_low   = float(last["low"])
+    last_high  = float(last["high"])
+    prev_close = float(prev["close"])
+
+    # 1SD bands (entry/exit trigger)
+    u1 = bb_now["upper"]
+    l1 = bb_now["lower"]
+    # 2SD bands (momentum zone boundary)
+    u2 = bb2_now["upper"]
+    l2 = bb2_now["lower"]
+    basis = bb_now["basis"]
+
+    # Expansion filter: bands must be widening (matches TradingView expandThresh=1.02)
+    bb_width_now  = bb_now["width"]
+    bb_width_prev = bb_prev["width"]
+    expanding = bb_width_now > bb_width_prev * 1.02
+
+    # Entry window: no new entries at or after 22:00 broker time
+    broker_hour = datetime.now(MARKET_TIMEZONE).hour
+    entry_window_open = broker_hour < 22
+
+    # Crossover / crossunder detection (Pine-style)
+    crossed_above_u1 = prev_close <= u1 and last_close > u1 and expanding and entry_window_open
+    crossed_below_l1 = prev_close >= l1 and last_close < l1 and expanding and entry_window_open
+
+    # Min hold bars: block exit for 5 M15 bars (75 min) after entry
+    M15_BAR_SECONDS = 15 * 60
+    MIN_HOLD_BARS = 5
+    trade_entry_at = float(AUTOTRADE_STATE.get("dbb_entry_at", 0.0) or 0.0)
+    bars_held = int((time.time() - trade_entry_at) / M15_BAR_SECONDS) if trade_entry_at > 0 else 0
+    min_hold_ok = bars_held >= MIN_HOLD_BARS
+
+    # Record entry time when a new signal fires
+    if crossed_above_u1 or crossed_below_l1:
+        AUTOTRADE_STATE["dbb_entry_at"] = time.time()
+
+    dbb_parameters = {
+        "boardBias": bias,
+        "m15Phase": market_phase,
+        "activePrice": round(current_price, 2),
+        "basis": basis,
+        "u1": u1,
+        "u2": u2,
+        "l1": l1,
+        "l2": l2,
+        "expanding": expanding,
+        "bbWidthNow": bb_width_now,
+        "bbWidthPrev": bb_width_prev,
+        "barsHeld": bars_held,
+        "minHoldOk": min_hold_ok,
+        "crossedAboveU1": crossed_above_u1,
+        "crossedBelowL1": crossed_below_l1,
+    }
+
+    why: list[str] = [
+        f"DBB M15: basis {basis:.2f}, 1SD {l1:.2f}-{u1:.2f}, 2SD {l2:.2f}-{u2:.2f}",
+        f"Bands {'expanding' if expanding else 'flat'}: width {bb_width_now:.2f} vs prev {bb_width_prev:.2f}",
+    ]
+    conflicts: list[str] = []
+    if not expanding:
+        conflicts.append("Bands not expanding - entry blocked per expansion filter")
+    if bias == "bullish":
+        why.append("M15 structure leans bullish")
+    elif bias == "bearish":
+        why.append("M15 structure leans bearish")
+    else:
+        conflicts.append("M15 structure is mixed - both directions possible")
+
+    # --- Long signal: close crossed above u1 AND bands expanding ---
+    if crossed_above_u1:
+        entry = round(current_price, 2)
+        sl = clamp_stop_distance(entry, last_low - buffer, "buy", "double_b_buy")
+        tp1, tp2 = build_rr_targets(entry, sl, "buy", "double_b_buy")
+        zone_text = f"{u1:.2f}-{u2:.2f}"
+        return build_trade_payload(
+            board=board,
+            side="buy",
             market_phase=market_phase,
             bias=bias,
-            setup_type=str(chosen_trade["setup_type"]),
-            location=str(chosen_trade.get("location_label", location)),
-            zone_text=str(chosen_trade["zone_text"]),
-            reason=str(chosen_trade["reason"]),
-            why=why + [f"Execution area is {str(chosen_trade.get('location_label', location)).replace('_', ' ')}", str(chosen_trade["trigger"])],
+            setup_type="double_b_buy",
+            location="momentum_zone",
+            zone_text=zone_text,
+            reason="M15 close crossed above the 1SD upper band - price entered the bullish momentum zone.",
+            why=why + [f"Close {last_close:.2f} crossed above u1 {u1:.2f}", "Momentum zone entry per DBB strategy"],
             conflicts=conflicts,
-            trigger_text=str(chosen_trade["trigger"]),
-            execution_plan=f"{str(chosen_trade['side']).upper()} from {str(chosen_trade['zone_text'])} with invalidation beyond structure and targets into opposing liquidity.",
-            entry=safe_float(chosen_trade["entry"]),
-            sl=safe_float(chosen_trade["sl"]),
-            tp1=safe_float(chosen_trade["tp1"]),
-            tp2=safe_float(chosen_trade["tp2"]),
-            pattern_candidates=compact_candidates,
+            trigger_text=f"M15 crossover above u1 {u1:.2f}",
+            execution_plan="BUY now at market; SL below signal candle low, TP1 at 3R, TP2 at 4.5R.",
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            model=CURRENT_STRATEGY_MODEL,
+            pattern_candidates=[],
             entry_checks={
-                "zone_ok": buy_zone_ok if str(chosen_trade["side"]) == "buy" else sell_zone_ok,
-                "confirmation_ok": buy_confirmation_ok if str(chosen_trade["side"]) == "buy" else sell_confirmation_ok,
-                "zone_text": str(chosen_trade["zone_text"]),
+                "zone_ok": True,
+                "confirmation_ok": True,
+                "zone_text": zone_text,
                 "price": round(current_price, 2),
-                "signal": str(chosen_trade.get("signal", "") or ""),
+                "signal": "dbb_crossover_long",
+                "u1": u1,
+                "u2": u2,
             },
             wait_for=[],
-            smc_parameters=smc_parameters,
+            smc_parameters=dbb_parameters,
         )
 
-    if bias == "bullish":
-        if not buy_zone_ok:
-            conflicts.append("Price has moved away from the buy zone")
-        if not buy_confirmation_ok:
-            conflicts.append("M5/M1 confirmation candle is missing")
-        wait_why = list(why)
-        if active_signal is not None and not buy_confirmation_ok:
-            wait_why.append(f"Active structure: {str(active_signal.get('trigger') or active_signal.get('signal') or '')}")
-        elif ltf_tone == "bullish" and not buy_confirmation_ok:
-            wait_why = [
-                "H1 context is bullish and M15 is supportive",
-                "M5/M1 is stabilizing but not confirmed yet",
-                "Price is near support / pullback value",
-            ]
+    # --- Short signal: close crossed below l1 (entered the lower momentum zone) ---
+    if crossed_below_l1:
+        entry = round(current_price, 2)
+        sl = clamp_stop_distance(entry, last_high + buffer, "sell", "double_b_sell")
+        tp1, tp2 = build_rr_targets(entry, sl, "sell", "double_b_sell")
+        zone_text = f"{l2:.2f}-{l1:.2f}"
         return build_trade_payload(
             board=board,
-            side="none",
+            side="sell",
             market_phase=market_phase,
             bias=bias,
-            setup_type="none",
-            location=location,
-            zone_text=str(active_signal.get("zone_text")) if active_signal is not None else pullback_buy_zone,
-            reason="Bullish context is valid, but the M5 trigger is not complete yet." if active_signal is not None else "Bullish context is clear, but no valid SMC structure is active yet.",
-            why=wait_why,
+            setup_type="double_b_sell",
+            location="momentum_zone",
+            zone_text=zone_text,
+            reason="M15 close crossed below the 1SD lower band - price entered the bearish momentum zone.",
+            why=why + [f"Close {last_close:.2f} crossed below l1 {l1:.2f}", "Momentum zone entry per DBB strategy"],
             conflicts=conflicts,
-            trigger_text=str(active_signal.get("trigger")) if active_signal is not None else "Waiting for M5/M1 bullish confirmation.",
-            execution_plan="Wait for M5/M1 confirmation inside the active bullish SMC zone." if active_signal is not None else "Wait for a clean bullish structure on M15 and a valid M5 trigger before buying.",
-            entry=None,
-            sl=None,
-            tp1=None,
-            tp2=None,
-            pattern_candidates=compact_candidates,
+            trigger_text=f"M15 crossunder below l1 {l1:.2f}",
+            execution_plan="SELL now at market; SL above signal candle high, TP1 at 3R, TP2 at 4.5R.",
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            model=CURRENT_STRATEGY_MODEL,
+            pattern_candidates=[],
             entry_checks={
-                "zone_ok": buy_zone_ok,
-                "confirmation_ok": buy_confirmation_ok,
-                "zone_text": str(active_signal.get("zone_text")) if active_signal is not None else pullback_buy_zone,
+                "zone_ok": True,
+                "confirmation_ok": True,
+                "zone_text": zone_text,
                 "price": round(current_price, 2),
-                "signal": str(active_signal.get("signal", "") or "") if active_signal is not None else "",
+                "signal": "dbb_crossunder_short",
+                "l1": l1,
+                "l2": l2,
             },
-            wait_for=build_wait_requirements(
-                bias=bias,
-                active_signal=active_signal,
-                zone_ok=buy_zone_ok,
-                confirmation_ok=buy_confirmation_ok,
-                location=location,
-            ),
-            smc_parameters=smc_parameters,
+            wait_for=[],
+            smc_parameters=dbb_parameters,
         )
 
-    if bias == "bearish":
-        if not sell_zone_ok:
-            conflicts.append("Price has moved away from the sell zone")
-        if not sell_confirmation_ok:
-            conflicts.append("M5/M1 confirmation candle is missing")
-        wait_why = list(why)
-        if active_signal is not None and not sell_confirmation_ok:
-            wait_why.append(f"Active structure: {str(active_signal.get('trigger') or active_signal.get('signal') or '')}")
-        elif ltf_tone == "bearish" and not sell_confirmation_ok:
-            wait_why = [
-                "H1 context is bearish and M15 is supportive",
-                "M5/M1 is softening but not confirmed yet",
-                "Price is near resistance / rally value",
-            ]
-        return build_trade_payload(
-            board=board,
-            side="none",
-            market_phase=market_phase,
-            bias=bias,
-            setup_type="none",
-            location=location,
-            zone_text=str(active_signal.get("zone_text")) if active_signal is not None else rally_sell_zone,
-            reason="Bearish context is valid, but the M5 trigger is not complete yet." if active_signal is not None else "Bearish context is clear, but no valid SMC structure is active yet.",
-            why=wait_why,
-            conflicts=conflicts,
-            trigger_text=str(active_signal.get("trigger")) if active_signal is not None else "Waiting for M5/M1 bearish confirmation.",
-            execution_plan="Wait for M5/M1 confirmation inside the active bearish SMC zone." if active_signal is not None else "Wait for a clean bearish structure on M15 and a valid M5 trigger before selling.",
-            entry=None,
-            sl=None,
-            tp1=None,
-            tp2=None,
-            pattern_candidates=compact_candidates,
-            entry_checks={
-                "zone_ok": sell_zone_ok,
-                "confirmation_ok": sell_confirmation_ok,
-                "zone_text": str(active_signal.get("zone_text")) if active_signal is not None else rally_sell_zone,
-                "price": round(current_price, 2),
-                "signal": str(active_signal.get("signal", "") or "") if active_signal is not None else "",
-            },
-            wait_for=build_wait_requirements(
-                bias=bias,
-                active_signal=active_signal,
-                zone_ok=sell_zone_ok,
-                confirmation_ok=sell_confirmation_ok,
-                location=location,
-            ),
-            smc_parameters=smc_parameters,
-        )
+    # --- No signal: price is in the neutral zone ---
+    if last_close > u1:
+        no_trade_reason = f"Price is already inside the upper momentum zone ({u1:.2f}-{u2:.2f}) - waiting for a fresh crossover on the next candle."
+    elif last_close < l1:
+        no_trade_reason = f"Price is already inside the lower momentum zone ({l2:.2f}-{l1:.2f}) - waiting for a fresh crossunder on the next candle."
+    else:
+        no_trade_reason = f"Price {last_close:.2f} is in the neutral zone ({l1:.2f}-{u1:.2f}) - no DBB signal active."
 
     return build_trade_payload(
         board=board,
@@ -2652,33 +2387,148 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
         bias=bias,
         setup_type="none",
         location=location,
-        zone_text="No clear zone",
-        reason="Context is mixed and no clean pattern has activated.",
+        zone_text=f"{l1:.2f}-{u1:.2f}",
+        reason=no_trade_reason,
         why=why,
         conflicts=conflicts,
-        trigger_text="No trigger is active now.",
-        execution_plan="Wait for clearer H1 context, stronger M15 structure, and cleaner M5/M1 timing.",
+        trigger_text="Waiting for M15 close to cross above u1 or below l1.",
+        execution_plan="Wait for a confirmed M15 candle close into the 1SD momentum zone before entering.",
         entry=None,
         sl=None,
         tp1=None,
         tp2=None,
-        pattern_candidates=compact_candidates,
+        model=CURRENT_STRATEGY_MODEL,
+        pattern_candidates=[],
         entry_checks={
             "zone_ok": False,
             "confirmation_ok": False,
-            "zone_text": "No clear zone",
+            "zone_text": f"{l1:.2f}-{u1:.2f}",
             "price": round(current_price, 2),
             "signal": "",
+            "u1": u1,
+            "l1": l1,
         },
-        wait_for=build_wait_requirements(
-            bias=bias,
-            active_signal=active_signal,
-            zone_ok=False,
-            confirmation_ok=False,
-            location=location,
-        ),
-        smc_parameters=smc_parameters,
+        wait_for=[
+            f"M15 close above {u1:.2f} to trigger long",
+            f"M15 close below {l1:.2f} to trigger short",
+        ],
+        smc_parameters=dbb_parameters,
     )
+
+def close_position(symbol: str, ticket: int, side: str, volume: float) -> dict[str, object]:
+    with MT5_LOCK:
+        if not mt5.initialize():
+            raise RuntimeError("Could not connect to MetaTrader 5.")
+        try:
+            resolved_symbol = resolve_symbol(symbol)
+            symbol_info = mt5.symbol_info(resolved_symbol)
+            if symbol_info is None:
+                raise RuntimeError(f"Could not resolve MT5 symbol for {symbol}.")
+            tick = mt5.symbol_info_tick(resolved_symbol)
+            if tick is None:
+                code, description = mt5.last_error()
+                raise RuntimeError(f"Could not load live tick for {resolved_symbol}. MT5 error {code}: {description}")
+            digits = int(getattr(symbol_info, "digits", 2) or 2)
+            close_type = mt5.ORDER_TYPE_SELL if side == "buy" else mt5.ORDER_TYPE_BUY
+            price = float(tick.bid if side == "buy" else tick.ask)
+            normalized_volume = normalize_volume(symbol_info, volume)
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "magic": AUTOTRADE_MAGIC,
+                "symbol": resolved_symbol,
+                "volume": normalized_volume,
+                "type": close_type,
+                "position": ticket,
+                "price": round(price, digits),
+                "deviation": 20,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "comment": f"{AUTOTRADE_COMMENT}-exit",
+            }
+            filling_modes = [
+                ("FOK", mt5.ORDER_FILLING_FOK),
+                ("IOC", mt5.ORDER_FILLING_IOC),
+                ("RETURN", mt5.ORDER_FILLING_RETURN),
+            ]
+            result = None
+            for _, mode_value in filling_modes:
+                request["type_filling"] = mode_value
+                result = mt5.order_send(request)
+                if result is None:
+                    continue
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    break
+                if result.retcode != 10030:
+                    break
+            if result is None:
+                code, description = mt5.last_error()
+                raise RuntimeError(f"MT5 close order_send returned nothing. Error {code}: {description}")
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                detail = getattr(result, "comment", "") or f"Retcode {result.retcode}"
+                return {"status": "rejected", "detail": f"MT5 rejected close: {detail}", "retcode": int(result.retcode)}
+            return {"status": "closed", "detail": "Position closed via DBB dynamic exit.", "ticket": ticket, "retcode": int(result.retcode)}
+        finally:
+            mt5.shutdown()
+
+
+def check_dbb_exit(board: dict[str, object]) -> dict[str, object]:
+    active_trade = AUTOTRADE_STATE.get("active_trade")
+    if not active_trade or not AUTOTRADE_STATE.get("trade_active"):
+        return {"exit": False, "reason": "no_open_trade"}
+
+    side = str(active_trade.get("side", "") or "")
+    if side not in {"buy", "sell"}:
+        return {"exit": False, "reason": "unknown_side"}
+
+    m15 = get_frame(board, "M15")
+    m15_candles = recent_candles(m15, 30)
+    if len(m15_candles) < 3:
+        return {"exit": False, "reason": "not_enough_candles"}
+
+    bb_now = compute_bollinger_band(m15_candles, period=20, std_dev=1.0, source="close")
+    if bb_now is None:
+        return {"exit": False, "reason": "bb_not_ready"}
+
+    last_close = float(m15_candles[-1]["close"])
+    prev_close = float(m15_candles[-2]["close"])
+    u1 = bb_now["upper"]
+    l1 = bb_now["lower"]
+
+    # Min hold: only allow exit after 5 M15 bars (75 min) since entry
+    M15_BAR_SECONDS = 15 * 60
+    MIN_HOLD_BARS = 5
+    trade_entry_at = float(AUTOTRADE_STATE.get("dbb_entry_at", 0.0) or 0.0)
+    bars_held = int((time.time() - trade_entry_at) / M15_BAR_SECONDS) if trade_entry_at > 0 else 99
+    if bars_held < MIN_HOLD_BARS:
+        return {"exit": False, "reason": f"min_hold_not_met ({bars_held}/{MIN_HOLD_BARS} bars)", "u1": u1, "l1": l1}
+
+    # Long exit: price crossed back under u1 (momentum lost)
+    if side == "buy" and prev_close >= u1 and last_close < u1:
+        ticket = int(active_trade.get("ticket", 0) or 0)
+        volume = float(active_trade.get("volume", 0.01) or 0.01)
+        symbol = str(active_trade.get("symbol", "") or "")
+        result = close_position(symbol, ticket, "buy", volume)
+        AUTOTRADE_STATE["dbb_entry_at"] = 0.0
+        append_ai_logic_audit(build_ai_logic_event(
+            "dbb_dynamic_exit", "closed", symbol,
+            detail=f"Long exit: close {last_close:.2f} crossed under u1 {u1:.2f} after {bars_held} bars. {result.get('detail', '')}",
+        ))
+        return {"exit": True, "reason": "crossunder_u1", "u1": u1, "last_close": last_close, "result": result}
+
+    # Short exit: price crossed back above l1 (momentum lost)
+    if side == "sell" and prev_close <= l1 and last_close > l1:
+        ticket = int(active_trade.get("ticket", 0) or 0)
+        volume = float(active_trade.get("volume", 0.01) or 0.01)
+        symbol = str(active_trade.get("symbol", "") or "")
+        result = close_position(symbol, ticket, "sell", volume)
+        AUTOTRADE_STATE["dbb_entry_at"] = 0.0
+        append_ai_logic_audit(build_ai_logic_event(
+            "dbb_dynamic_exit", "closed", symbol,
+            detail=f"Short exit: close {last_close:.2f} crossed above l1 {l1:.2f} after {bars_held} bars. {result.get('detail', '')}",
+        ))
+        return {"exit": True, "reason": "crossover_l1", "l1": l1, "last_close": last_close, "result": result}
+
+    return {"exit": False, "reason": "hold", "side": side, "u1": u1, "l1": l1, "last_close": last_close}
+
 
 def model_safe_token(model: str) -> str:
     normalized = "".join(char.lower() if char.isalnum() else "-" for char in str(model or "model"))
@@ -2890,11 +2740,6 @@ def evaluate_autotrade_signal(
             detail = "Signal already processed."
             log_autotrade("autotrade_dispatch", "duplicate", detail)
             return HTTPStatus.OK.value, {"status": "duplicate", "detail": detail}
-        if (not AUTOTRADE_STATE["trade_active"]) and now - float(AUTOTRADE_STATE["last_trade_at"]) < AUTOTRADE_COOLDOWN_SECONDS:
-            detail = "Auto trade cooldown active."
-            remaining = get_cooldown_remaining_seconds()
-            log_autotrade("autotrade_dispatch", "cooldown", detail, cooldown_remaining_seconds=remaining)
-            return HTTPStatus.OK.value, {"status": "cooldown", "detail": detail, "cooldown_remaining_seconds": remaining}
         AUTOTRADE_STATE["last_attempt_at"] = now
 
     result = place_market_order(normalized_symbol, normalized_side, lot_value, sl_value, tp_value)
@@ -3450,11 +3295,7 @@ def place_market_order(symbol: str, side: str, lot: float, sl: float | None, tp:
 
 
 def get_cooldown_remaining_seconds() -> int:
-    last_trade_at = float(AUTOTRADE_STATE.get("last_trade_at", 0.0) or 0.0)
-    if last_trade_at <= 0:
-        return 0
-    remaining = AUTOTRADE_COOLDOWN_SECONDS - (time.time() - last_trade_at)
-    return max(0, int(remaining))
+    return 0
 
 
 def maybe_sync_google_sheet_after_close() -> None:
@@ -4035,10 +3876,15 @@ def run_autonomous_ai_cycle() -> dict[str, object]:
         symbol = str(AUTONOMOUS_AI_STATE.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL)
         model = str(AUTONOMOUS_AI_STATE.get("model", AUTONOMOUS_AI_MODEL) or AUTONOMOUS_AI_MODEL)
     board = build_server_board_snapshot(symbol, AUTONOMOUS_AI_CONTEXT_BARS)
+    sync_autotrade_lifecycle()
+    exit_check = check_dbb_exit(board)
+    if exit_check.get("exit"):
+        sync_autotrade_lifecycle()
     image_b64 = load_latest_board_image_b64()
     result = execute_ai_trade_decision(model, board, image_b64)
     outcome: dict[str, object] = dict(result)
     outcome["board_generated_at"] = str(board.get("generated_at", "") or "")
+    outcome["dbb_exit_check"] = exit_check
     outcome["autotrade"] = None
     if bool(result.get("should_trade")) and str(result.get("decision", "")).strip().lower() in {"buy", "sell"}:
         status_code, autotrade_result = evaluate_autotrade_signal(
@@ -4062,18 +3908,31 @@ def run_autonomous_ai_cycle() -> dict[str, object]:
     return outcome
 
 
-def seconds_until_next_autonomous_boundary() -> float:
-    now = time.time()
-    return AUTONOMOUS_AI_INTERVAL_SECONDS - (now % AUTONOMOUS_AI_INTERVAL_SECONDS)
+def get_latest_m15_bar_time(symbol: str) -> int | None:
+    """Return the open timestamp of the most recent closed M15 bar, or None if unavailable."""
+    try:
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 1, 1)
+        if rates is not None and len(rates) > 0:
+            return int(rates[0]["time"])
+    except Exception:
+        pass
+    return None
 
 
 def autonomous_ai_worker() -> None:
+    last_m15_bar_time: int | None = None
+    with AUTONOMOUS_AI_LOCK:
+        symbol = str(AUTONOMOUS_AI_STATE.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL)
     while True:
         try:
             with AUTONOMOUS_AI_LOCK:
                 enabled = bool(AUTONOMOUS_AI_STATE.get("enabled", False))
+                symbol = str(AUTONOMOUS_AI_STATE.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL)
             if enabled:
-                run_autonomous_ai_cycle()
+                bar_time = get_latest_m15_bar_time(symbol)
+                if bar_time is not None and bar_time != last_m15_bar_time:
+                    last_m15_bar_time = bar_time
+                    run_autonomous_ai_cycle()
         except Exception as error:
             append_ai_logic_audit(
                 build_ai_logic_event(
@@ -4087,7 +3946,7 @@ def autonomous_ai_worker() -> None:
             with AUTONOMOUS_AI_LOCK:
                 AUTONOMOUS_AI_STATE["last_run_at"] = datetime.now(timezone.utc).isoformat()
                 AUTONOMOUS_AI_STATE["last_error"] = str(error)
-        time.sleep(max(1.0, seconds_until_next_autonomous_boundary()))
+        time.sleep(5)
 
 
 def google_sheet_sync_worker() -> None:
@@ -4101,7 +3960,7 @@ def google_sheet_sync_worker() -> None:
 
 class AppHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(ROOT), **kwargs)
+        super().__init__(*args, directory=str(FRONTEND_ROOT), **kwargs)
 
     def end_headers(self) -> None:
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
@@ -4147,7 +4006,21 @@ class AppHandler(SimpleHTTPRequestHandler):
             self.handle_tick(parsed.query)
             return
 
+        if parsed.path == "/" or parsed.path == "":
+            self.path = "/index.html"
+            super().do_GET()
+            return
+
         super().do_GET()
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        if code == HTTPStatus.NOT_FOUND and FRONTEND_ROOT == NEURAL_APP_DIST:
+            index_path = FRONTEND_ROOT / "index.html"
+            if index_path.exists():
+                self.path = "/index.html"
+                super().do_GET()
+                return
+        super().send_error(code, message, explain)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -4165,6 +4038,10 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/autotrade/evaluate":
             self.handle_autotrade_evaluate()
+            return
+
+        if parsed.path == "/api/dbb/webhook":
+            self.handle_dbb_webhook()
             return
 
         self.respond_json(HTTPStatus.NOT_FOUND, {"detail": "Unknown endpoint."})
@@ -4425,6 +4302,79 @@ class AppHandler(SimpleHTTPRequestHandler):
         )
         self.respond_json(HTTPStatus(status_code), result)
 
+    def handle_dbb_webhook(self) -> None:
+        try:
+            payload = self.read_json_body()
+        except ValueError as error:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": str(error)})
+            return
+
+        action = str(payload.get("action", "") or "").strip().lower()
+        symbol = str(payload.get("symbol", "XAUUSD") or "XAUUSD").strip().upper().replace(".P", "").replace("GOLD", "XAUUSD")
+        lot = float(AUTOTRADE_STATE.get("lot", 0.01) or 0.01)
+
+        if not AUTOTRADE_STATE.get("enabled"):
+            self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": "Autotrade is disabled."})
+            return
+
+        try:
+            sync_autotrade_lifecycle()
+        except Exception as error:
+            self.respond_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": f"Failed to sync lifecycle: {error}"})
+            return
+
+        # --- Entry signals ---
+        if action in {"buy", "sell"}:
+            if AUTOTRADE_STATE.get("trade_active"):
+                self.respond_json(HTTPStatus.OK, {"status": "blocked", "detail": "A trade is already open."})
+                return
+            try:
+                result = place_market_order(symbol, action, lot, sl=None, tp=None)
+            except Exception as error:
+                self.respond_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": str(error)})
+                return
+            if result.get("status") == "placed":
+                AUTOTRADE_STATE["trade_active"] = True
+                AUTOTRADE_STATE["trade_seen_open"] = False
+                append_ai_logic_audit(build_ai_logic_event(
+                    "dbb_webhook", "opened", symbol,
+                    detail=f"TradingView webhook fired {action.upper()} at {payload.get('price', '?')}. Ticket: {result.get('ticket')}",
+                ))
+            self.respond_json(HTTPStatus.OK, result)
+            return
+
+        # --- Exit signals ---
+        if action in {"close_buy", "close_sell"}:
+            active_trade = AUTOTRADE_STATE.get("active_trade")
+            if not active_trade or not AUTOTRADE_STATE.get("trade_active"):
+                self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": "No open trade to close."})
+                return
+            ticket = int(active_trade.get("ticket", 0) or 0)
+            side = str(active_trade.get("side", "") or "")
+            volume = float(active_trade.get("volume", lot) or lot)
+            trade_symbol = str(active_trade.get("symbol", symbol) or symbol)
+            if (action == "close_buy" and side != "buy") or (action == "close_sell" and side != "sell"):
+                self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": f"Open trade is {side}, webhook said {action}."})
+                return
+            try:
+                result = close_position(trade_symbol, ticket, side, volume)
+            except Exception as error:
+                self.respond_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": str(error)})
+                return
+            if result.get("status") == "closed":
+                AUTOTRADE_STATE["last_trade_at"] = time.time()
+                AUTOTRADE_STATE["trade_active"] = False
+                AUTOTRADE_STATE["trade_seen_open"] = False
+                AUTOTRADE_STATE["active_trade"] = None
+                append_ai_logic_audit(build_ai_logic_event(
+                    "dbb_webhook", "closed", trade_symbol,
+                    detail=f"TradingView webhook fired {action} at {payload.get('price', '?')}. Ticket: {ticket}",
+                ))
+            self.respond_json(HTTPStatus.OK, result)
+            return
+
+        self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": f"Unknown action: '{action}'. Expected buy, sell, close_buy, or close_sell."})
+
     def respond_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status.value)
@@ -4445,8 +4395,12 @@ def main() -> None:
     sheet_sync_thread = threading.Thread(target=google_sheet_sync_worker, name="google-sheet-sync-worker", daemon=True)
     sheet_sync_thread.start()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
-    print(f"Serving Quantum workspace at http://{HOST}:{PORT}")
-    print(f"Autonomous AI loop active for {AUTONOMOUS_AI_SYMBOL} every {AUTONOMOUS_AI_INTERVAL_SECONDS // 60} minutes.")
+    frontend_label = "Neural Alpha dist" if FRONTEND_ROOT == NEURAL_APP_DIST else "Quantum workspace"
+    print(f"Serving {frontend_label} at http://{HOST}:{PORT}")
+    if AUTONOMOUS_AI_ENABLED_BY_DEFAULT:
+        print(f"Autonomous AI loop active for {AUTONOMOUS_AI_SYMBOL} every {AUTONOMOUS_AI_INTERVAL_SECONDS // 60} minutes.")
+    else:
+        print("Autonomous AI loop disabled by default. Local DBB chart signals are the active trade source.")
     print(f"Google Sheets sync worker active every {GOOGLE_SHEET_SYNC_INTERVAL_SECONDS} seconds.")
     print("Keep this terminal window open while using the site.")
     try:
