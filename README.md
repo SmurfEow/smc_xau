@@ -1,204 +1,97 @@
 # Quantum
 
-Quantum is a local MT5 auto-trading workspace for `XAUUSD` powered by a **Double Bollinger Band (DBB) Momentum** strategy.
+Quantum is a local MT5 auto-trading workspace for `XAUUSD` powered by a Double Bollinger Band (DBB) Momentum strategy.
 
-- live M15 signal detection tied to MT5 bar closes
-- autonomous entry and exit execution through MT5
-- Neural Alpha frontend as the control and monitoring layer
-- Google Sheets sync for trade history
+- Live MT5 candles and ticks
+- Neural Alpha React dashboard for monitoring and control
+- DBB signal plotting with realistic next-candle entry/exit markers
+- Optional dashboard-driven auto-trade execution through MT5
+- Trade/audit logs and Google Sheets sync support
 
-The server is the engine. The Neural Alpha dashboard is the display and control layer.
+The Python server is the MT5/API engine. The Neural Alpha dashboard is the live chart, control, and local DBB signal layer.
 
 ---
 
-## Current Strategy — Double Bollinger Band (DBB) Momentum
+## Current Strategy: Double Bollinger Band Momentum
 
 ### Parameters
 
 | Parameter | Value |
 |---|---|
-| Timeframe | M15 |
-| BB Length | 20 |
-| Inner Band (1SD) | `basis ± 1 × stdev` |
-| Outer Band (2SD) | `basis ± 2 × stdev` |
-| Band Expansion Threshold | 1.02 |
-| Min Hold Bars | 5 (75 minutes) |
-| Entry Window | No new entries at or after 22:00 broker time |
-| Lot Size | 0.10 |
+| Symbol | `XAUUSD` or broker equivalent such as `XAUUSD.m` |
+| Strategy timeframe | M15 |
+| BB length | 20 |
+| Inner band | `basis +/- 1 * stdev` |
+| Outer band | `basis +/- 2 * stdev` |
+| Band expansion threshold | 1.02 |
+| Minimum hold | 5 M15 bars |
+| Default lot size | 0.10 |
 
 ### Entry Logic
 
-- **Long:** M15 close crosses above the 1SD upper band (`u1`) AND bands are expanding
-- **Short:** M15 close crosses below the 1SD lower band (`l1`) AND bands are expanding
-- Entries are blocked at or after 22:00 broker time
+- Long signal: confirmed M15 close crosses above the 1SD upper band and bands are expanding.
+- Short signal: confirmed M15 close crosses below the 1SD lower band and bands are expanding.
+- The signal is detected on the closed candle.
+- The actual plotted action point is the next candle open.
 
 ### Exit Logic
 
-- **Long exit:** M15 close crosses back under `u1` — only allowed after 5 bars (75 min) have passed since entry
-- **Short exit:** M15 close crosses back over `l1` — only allowed after 5 bars (75 min) have passed since entry
+- Long exit: confirmed M15 close crosses back under the 1SD upper band after the minimum hold.
+- Short exit: confirmed M15 close crosses back over the 1SD lower band after the minimum hold.
+- Exit markers are also plotted on the next candle open because that is the realistic close action point.
 
-### Band Expansion Filter
+### Expansion Filter
 
-A new entry is only valid when the current band width is more than 2% wider than the previous bar's band width:
-
-```
-expanding = (u1 - l1) > (u1_prev - l1_prev) × 1.02
-```
-
-This filters out low-momentum, choppy markets and only enters during genuine breakout moves.
-
-### Backtest Results (TradingView, Feb–Apr 2026, M15)
-
-| Metric | Value |
-|---|---|
-| Total P&L | +$12,326 |
-| Return | +122.80% |
-| Max Drawdown | 15.36% |
-| Win Rate | 49.07% (105/214) |
-| Profit Factor | 1.728 |
-| Avg Win | $276.69 |
-| Avg Loss | $154.23 |
-| Avg Bars Held | 12 |
-
-### Why It Works
-
-- Entries only fire during expanding momentum — avoids choppy consolidation
-- Dynamic exits (crossback through u1/l1) let winners run and cut losers naturally
-- Min hold bars prevents whipsaw exits on noise right after entry
-- Winners naturally hold for ~13 bars, losers exit at ~10 bars — the hold window filters fast losers
-
----
-
-## Architecture
-
-### Core Flow
-
-1. `server.py` starts the local HTTP server on `127.0.0.1:8090`
-2. A background worker watches for new M15 bar closes (polls every 5 seconds)
-3. On each new bar close, DBB bands are computed from live MT5 M15 data
-4. If a crossover/crossunder signal fires → MT5 order is placed immediately (within ~5 seconds of bar close)
-5. Exit check runs before every entry check — if min hold is met and price crosses back, position is closed
-6. All decisions and trades are logged for review
-
-### Signal Timing
-
-The autonomous worker fires on **M15 bar close**, not on a fixed timer. This means execution happens within ~5 seconds of bar close — effectively the same as TradingView alert-based trading without requiring a paid subscription.
-
----
-
-## Files
-
-### Backend
-
-- `server.py`
-  Main server, MT5 integration, DBB signal engine, autonomous bar-close worker, logging, auto-trade execution
-
-### Frontend
-
-- `neural_website_repo/`
-  Neural Alpha frontend (React/Vite). The compiled `dist/` folder is served by `server.py` automatically.
-
-### Strategy
-
-- `dbb_momentum_baseline.txt`
-  Pine Script v5 source for the DBB strategy — paste into TradingView for visual backtesting
-
-### Backtest
-
-- `dbb_backtest.py`
-  Python backtest using yfinance data (no MT5 needed). Set `INTERVAL` and `PERIOD` at the top.
-
-### Logs
-
-- `ai_trade_decisions.json` — every decision cycle output
-- `ai_trade_reviews.json` — executed trade review records
-- `ai_logic_audit.json` — pipeline and validation audit trail
-
-### Local Runtime Data
-
-- `manual_news_calendar.json` — manual news block events for auto-trade guard
-- `google_sheet_sync_state.json` — last sync state for Google Sheets
-
----
-
-## Auto-Trade
-
-### Enabling
-
-1. Run `server.py`
-2. Open `http://localhost:8090`
-3. Enable autotrade from the Neural Alpha dashboard
-
-Once enabled, the engine runs fully autonomously — no browser tab needs to stay open.
-
-### Guards
-
-Even when autotrade is enabled, an order will not be placed if:
-
-- A trade is already open
-- The entry window is closed (at or after 22:00 broker time)
-- A manual news block is active
-- The duplicate signal guard fires
-- Auto-trade is toggled off
-
-### Lot Size
-
-Current live lot size: `0.10` (10 oz XAUUSD = $10 per $1 price move)
-
----
-
-## Autonomous Behavior
-
-- **Trigger:** new M15 bar close (detected within ~5 seconds)
-- **Symbol:** `XAUUSD` (or broker equivalent e.g. `XAUUSD.m`)
-- **Exit check:** runs before entry check on every bar
-- **Entry check:** crossover/crossunder + expansion filter + entry window
-
----
-
-## Manual News Block
-
-The dashboard includes a broker-time news calendar.
-
-- events are entered in MT5 broker time
-- each saved event hard-blocks auto-trade for 45 minutes before and after
-- past broker-time dates cannot be added as new events
-
----
-
-## Google Sheets Sync
-
-`google_sheet_sync.py` publishes closed-trade results to Google Sheets.
-
-### Local Usage
-
-```powershell
-python google_sheet_sync.py
-python google_sheet_sync.py --json
-python google_sheet_sync.py --date 2026-03-31
+```text
+expanding = (u1 - l1) > (u1_prev - l1_prev) * 1.02
 ```
 
-### Push to Google Sheets
-
-```powershell
-$env:GOOGLE_SERVICE_ACCOUNT_JSON='C:\path\to\service-account.json'
-$env:GOOGLE_SHEET_ID='your-google-sheet-id'
-python google_sheet_sync.py --push
-```
-
-Auto-sync on trade close is active when credentials are set and `server.py` is running.
+This blocks low-momentum chop and only allows entries when the inner DBB width is expanding.
 
 ---
 
-## API Endpoints
+## Live Chart Behavior
 
-- `/api/sync` — live board and timeframe data
-- `/api/tick` — latest tick
-- `/api/ai/status` — latest strategy output and autonomous status
-- `/api/ai/trade` — manual on-demand setup evaluation
-- `/api/autotrade/status` — autotrade state
-- `/api/autotrade/config` — autotrade configuration
-- `/api/history/dashboard` — dashboard analytics and MT5 closed history
+The dashboard separates cheap live updates from heavier sync work:
+
+- `/api/tick` is polled every 1 second.
+- The latest forming candle is patched from live tick price.
+- Recent MT5 candles sync every 2 seconds.
+- Heavier AI/board context refreshes less often to reduce chart lag.
+
+Chart markers:
+
+- `B` means DBB buy action.
+- `S` means DBB sell action.
+- `X` means DBB exit action.
+- Markers are shifted to the next candle and include a small horizontal tick at that candle's open price.
+
+The marker shift is visual only. The trading logic is controlled separately by the auto-trade effect and backend webhook.
+
+---
+
+## Auto-Trade Timing
+
+The dashboard DBB auto-trade path is intentionally next-candle based:
+
+1. M15 candle closes.
+2. The dashboard evaluates DBB signals using confirmed candles only.
+3. The next M15 candle appears.
+4. If the signal is from the just-closed candle, the dashboard sends `/api/dbb/webhook`.
+5. The backend sends the market order or close request to MT5 immediately.
+
+Current guard:
+
+- Signals are computed from `m15Candles.slice(0, -1)` so the forming candle is not used.
+- Execution is allowed only during the first 5 seconds of the next M15 candle.
+- Duplicate signals are blocked by signal time and type.
+
+Expected timing:
+
+- Usually within the 1-second tick polling cadence after the new candle appears.
+- Exact zero-delay execution is not possible because the browser polls tick data, posts the webhook, and MT5 then sends the order.
+
+Important: the local DBB chart/webhook auto-trade path requires the dashboard tab to be open. The backend also has an autonomous worker path, but it is disabled by default unless configured through environment settings.
 
 ---
 
@@ -208,19 +101,93 @@ Auto-sync on trade close is active when credentials are set and `server.py` is r
 python server.py
 ```
 
-or
+or:
 
 ```powershell
 start_server.bat
 ```
 
-Then open: `http://localhost:8090`
+Then open:
+
+```text
+http://localhost:8090
+```
+
+---
+
+## Frontend
+
+Source:
+
+```text
+neural_website_repo/
+```
+
+Useful commands:
+
+```powershell
+cd neural_website_repo
+npm.cmd run lint
+npm.cmd run build
+```
+
+The compiled `neural_website_repo/dist/` folder is served by `server.py` when present.
+
+---
+
+## API Endpoints
+
+- `/api/timeframe` - candles for one timeframe
+- `/api/sync` - recent candles for all configured timeframes
+- `/api/tick` - latest MT5 tick
+- `/api/board` - full board snapshot with structure/context
+- `/api/ai/status` - current AI/autonomous status snapshot
+- `/api/autotrade/status` - autotrade state
+- `/api/autotrade/config` - enable/disable autotrade and lot size
+- `/api/dbb/webhook` - dashboard DBB buy/sell/close webhook
+- `/api/history/dashboard` - closed-trade analytics
+
+---
+
+## Files
+
+- `server.py` - local HTTP server, MT5 integration, API endpoints, order execution, logging
+- `neural_website_repo/src/components/TradingChart.tsx` - live chart, Trade Matrix, DBB plotting, dashboard webhook trigger
+- `dbb_momentum_baseline.txt` - Pine Script DBB reference
+- `dbb_backtest.py` - optional offline backtest helper
+- `google_sheet_sync.py` - Google Sheets sync helper
+- `ai_logic_audit.json` - audit trail
+- `ai_trade_decisions.json` - decision records
+- `ai_trade_reviews.json` - executed trade review records
+
+---
+
+## Google Sheets Sync
+
+Manual usage:
+
+```powershell
+python google_sheet_sync.py
+python google_sheet_sync.py --json
+python google_sheet_sync.py --date 2026-03-31
+```
+
+Push usage:
+
+```powershell
+$env:GOOGLE_SERVICE_ACCOUNT_JSON='C:\path\to\service-account.json'
+$env:GOOGLE_SHEET_ID='your-google-sheet-id'
+python google_sheet_sync.py --push
+```
+
+Auto-sync after closed trades is active when credentials are set and `server.py` is running.
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- MetaTrader 5 terminal (open and logged in)
+- MetaTrader 5 terminal open and logged in
 - `MetaTrader5` Python package
-- `yfinance` (optional, for offline backtest only)
+- Node.js for frontend development/builds
+- `yfinance` only if using `dbb_backtest.py`
