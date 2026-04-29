@@ -8,11 +8,6 @@ mult1        = input.float(1.0, "Inner Mult (1SD)")
 mult2        = input.float(2.0, "Outer Mult (2SD)")
 minHoldBars  = input.int(5, "Min Hold Bars (before exit allowed)", minval=1)
 expandThresh  = input.float(1.02, "Band Expansion Threshold", minval=1.0, step=0.01)
-lastEntryHour = input.int(22, "Last Entry Hour (Broker Time)", minval=0, maxval=23)
-
-// --- No New Entries After 10PM ---
-brokerHour = hour(time)
-entryWindowOpen = brokerHour < lastEntryHour
 
 // --- Calculations ---
 basis = ta.sma(src, length)
@@ -59,19 +54,19 @@ fill(p_u1, p_u2, color=color.new(color.green, 90), title="Bullish Momentum")
 fill(p_l1, p_l2, color=color.new(color.red, 90), title="Bearish Momentum")
 
 // --- Shared Signals ---
-longEntrySignal  = ta.crossover(close, u1) and expanding and entryWindowOpen
-shortEntrySignal = ta.crossunder(close, l1) and expanding and entryWindowOpen
-longExitSignal = ta.crossunder(close, u1) and barsSinceLongEntry >= minHoldBars
-shortExitSignal = ta.crossover(close, l1) and barsSinceShortEntry >= minHoldBars
+longEntrySignal  = strategy.position_size == 0 and ta.crossover(close, u1) and expanding
+shortEntrySignal = strategy.position_size == 0 and ta.crossunder(close, l1) and expanding
+longExitSignal   = strategy.position_size > 0 and ta.crossunder(close, u1) and barsSinceLongEntry >= minHoldBars
+shortExitSignal  = strategy.position_size < 0 and ta.crossover(close, l1) and barsSinceShortEntry >= minHoldBars
 
-// --- Entry Logic (autonomous from plotted signals) ---
+// --- Entry Logic ---
 if longEntrySignal
     strategy.entry("DBB Long", strategy.long)
 
 if shortEntrySignal
     strategy.entry("DBB Short", strategy.short)
 
-// --- Exit Logic (autonomous from plotted signals) ---
+// --- Exit Logic ---
 if longExitSignal
     strategy.close("DBB Long")
     barsSinceLongEntry := 0
@@ -80,11 +75,6 @@ if shortExitSignal
     strategy.close("DBB Short")
     barsSinceShortEntry := 0
 
-// --- Plot Markers ---
-plotshape(longEntrySignal, title="Long Entry Plot", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), text="BUY", textcolor=color.white, size=size.tiny)
-plotshape(shortEntrySignal, title="Short Entry Plot", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.tiny)
-plotshape(longExitSignal, title="Long Exit Plot", style=shape.circle, location=location.abovebar, color=color.new(color.aqua, 0), text="X", textcolor=color.white, size=size.tiny)
-plotshape(shortExitSignal, title="Short Exit Plot", style=shape.circle, location=location.belowbar, color=color.new(color.orange, 0), text="X", textcolor=color.white, size=size.tiny)
 
 // --- Webhook Alert Conditions ---
 alertcondition(longEntrySignal,  "DBB Long Entry",  '{"action":"buy","symbol":"{{ticker}}","price":{{close}},"tf":"{{interval}}"}')
