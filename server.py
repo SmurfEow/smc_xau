@@ -860,10 +860,7 @@ def build_timeframe_payload(symbol: str, timeframe: str, candles: list[dict[str,
         "distanceToSupport": distance_to_level(last_price, support),
         "distanceToResistance": distance_to_level(last_price, resistance),
     }
-    ob_bull = detect_order_blocks(candles, "buy", atr_value=float(atr_value or 6.0))
-    ob_bear = detect_order_blocks(candles, "sell", atr_value=float(atr_value or 6.0))
-    fvg_bull = detect_fvg(candles, "buy")
-    fvg_bear = detect_fvg(candles, "sell")
+
     return {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -883,14 +880,6 @@ def build_timeframe_payload(symbol: str, timeframe: str, candles: list[dict[str,
         "structure": classify_structure(candles),
         "volatility": {
             "atr": round(float(atr_value), 2) if atr_value is not None else None,
-        },
-        "orderBlocks": {
-            "bullish": ob_bull[:3],
-            "bearish": ob_bear[:3],
-        },
-        "fairValueGaps": {
-            "bullish": fvg_bull[:3],
-            "bearish": fvg_bear[:3],
         },
     }
 
@@ -2235,6 +2224,8 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
     # 1SD bands (entry/exit trigger)
     u1 = bb_now["upper"]
     l1 = bb_now["lower"]
+    prev_u1 = bb_prev["upper"]
+    prev_l1 = bb_prev["lower"]
     # 2SD bands (momentum zone boundary)
     u2 = bb2_now["upper"]
     l2 = bb2_now["lower"]
@@ -2250,8 +2241,8 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
     entry_window_open = broker_hour < 22
 
     # Crossover / crossunder detection (Pine-style)
-    crossed_above_u1 = prev_close <= u1 and last_close > u1 and expanding and entry_window_open
-    crossed_below_l1 = prev_close >= l1 and last_close < l1 and expanding and entry_window_open
+    crossed_above_u1 = prev_close <= prev_u1 and last_close > u1 and expanding
+    crossed_below_l1 = prev_close >= prev_l1 and last_close < l1 and expanding
 
     # Min hold bars: block exit for 5 M15 bars (75 min) after entry
     M15_BAR_SECONDS = 15 * 60
@@ -2485,13 +2476,16 @@ def check_dbb_exit(board: dict[str, object]) -> dict[str, object]:
         return {"exit": False, "reason": "not_enough_candles"}
 
     bb_now = compute_bollinger_band(m15_candles, period=20, std_dev=1.0, source="close")
-    if bb_now is None:
+    bb_prev = compute_bollinger_band(m15_candles, period=20, std_dev=1.0, source="close", offset=1)
+    if bb_now is None or bb_prev is None:
         return {"exit": False, "reason": "bb_not_ready"}
 
     last_close = float(m15_candles[-1]["close"])
     prev_close = float(m15_candles[-2]["close"])
     u1 = bb_now["upper"]
     l1 = bb_now["lower"]
+    prev_u1 = bb_prev["upper"]
+    prev_l1 = bb_prev["lower"]
 
     # Min hold: only allow exit after 5 M15 bars (75 min) since entry
     M15_BAR_SECONDS = 15 * 60
@@ -2502,7 +2496,7 @@ def check_dbb_exit(board: dict[str, object]) -> dict[str, object]:
         return {"exit": False, "reason": f"min_hold_not_met ({bars_held}/{MIN_HOLD_BARS} bars)", "u1": u1, "l1": l1}
 
     # Long exit: price crossed back under u1 (momentum lost)
-    if side == "buy" and prev_close >= u1 and last_close < u1:
+    if side == "buy" and prev_close >= prev_u1 and last_close < u1:
         ticket = int(active_trade.get("ticket", 0) or 0)
         volume = float(active_trade.get("volume", 0.01) or 0.01)
         symbol = str(active_trade.get("symbol", "") or "")
@@ -2515,7 +2509,7 @@ def check_dbb_exit(board: dict[str, object]) -> dict[str, object]:
         return {"exit": True, "reason": "crossunder_u1", "u1": u1, "last_close": last_close, "result": result}
 
     # Short exit: price crossed back above l1 (momentum lost)
-    if side == "sell" and prev_close <= l1 and last_close > l1:
+    if side == "sell" and prev_close <= prev_l1 and last_close > l1:
         ticket = int(active_trade.get("ticket", 0) or 0)
         volume = float(active_trade.get("volume", 0.01) or 0.01)
         symbol = str(active_trade.get("symbol", "") or "")
@@ -3191,13 +3185,38 @@ def normalize_volume(symbol_info, requested_lot: float) -> float:
     return round(normalized, 2)
 
 
-def has_open_trade(symbol: str) -> tuple[bool, str]:
+def _position_side(position) -> str:
+    return "buy" if int(getattr(position, "type", -1)) == getattr(mt5, "POSITION_TYPE_BUY", 0) else "sell"
+
+
+def _order_side(order) -> str:
+    buy_order_types = {
+        getattr(mt5, "ORDER_TYPE_BUY", 0),
+        getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2),
+        getattr(mt5, "ORDER_TYPE_BUY_STOP", 4),
+        getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", 6),
+    }
+    return "buy" if int(getattr(order, "type", -1)) in buy_order_types else "sell"
+
+
+def has_open_trade(symbol: str, side: str | None = None) -> tuple[bool, str]:
+    normalized_symbol = str(symbol or "").upper()
     positions = mt5.positions_get() or []
-    if positions:
-        return True, "An open position already exists, so only one trade is allowed at a time."
+    for position in positions:
+        position_symbol = str(getattr(position, "symbol", "") or "").upper()
+        if position_symbol != normalized_symbol:
+            continue
+        position_side = _position_side(position)
+        if side is None or position_side == side:
+            return True, f"An open {position_side} position already exists for {symbol}."
     orders = mt5.orders_get() or []
-    if orders:
-        return True, "A pending order already exists, so only one trade is allowed at a time."
+    for order in orders:
+        order_symbol = str(getattr(order, "symbol", "") or "").upper()
+        if order_symbol != normalized_symbol:
+            continue
+        order_side = _order_side(order)
+        if side is None or order_side == side:
+            return True, f"A pending {order_side} order already exists for {symbol}."
     return False, ""
 
 
@@ -3403,7 +3422,7 @@ def sync_autotrade_lifecycle() -> None:
                     "kind": "position",
                     "ticket": int(getattr(position, "ticket", 0) or 0),
                     "symbol": str(getattr(position, "symbol", "") or ""),
-                    "side": "buy" if int(getattr(position, "type", -1)) == getattr(mt5, "POSITION_TYPE_BUY", 0) else "sell",
+                    "side": _position_side(position),
                     "volume": float(getattr(position, "volume", 0.0) or 0.0),
                     "price": float(getattr(position, "price_open", 0.0) or 0.0),
                     "sl": float(getattr(position, "sl", 0.0) or 0.0),
@@ -3415,7 +3434,7 @@ def sync_autotrade_lifecycle() -> None:
                     "kind": "order",
                     "ticket": int(getattr(order, "ticket", 0) or 0),
                     "symbol": str(getattr(order, "symbol", "") or ""),
-                    "side": "buy" if int(getattr(order, "type", -1)) in {getattr(mt5, "ORDER_TYPE_BUY", 0), getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2), getattr(mt5, "ORDER_TYPE_BUY_STOP", 4), getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", 6)} else "sell",
+                    "side": _order_side(order),
                     "volume": float(getattr(order, "volume_current", 0.0) or getattr(order, "volume_initial", 0.0) or 0.0),
                     "price": float(getattr(order, "price_open", 0.0) or 0.0),
                     "sl": float(getattr(order, "sl", 0.0) or 0.0),
@@ -4325,9 +4344,24 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         # --- Entry signals ---
         if action in {"buy", "sell"}:
-            if AUTOTRADE_STATE.get("trade_active"):
-                self.respond_json(HTTPStatus.OK, {"status": "blocked", "detail": "A trade is already open."})
+            active_trade = AUTOTRADE_STATE.get("active_trade")
+            if AUTOTRADE_STATE.get("trade_active") and isinstance(active_trade, dict):
+                active_side = str(active_trade.get("side", "") or "")
+                if active_side == action:
+                    self.respond_json(HTTPStatus.OK, {
+                        "status": "blocked",
+                        "detail": f"Already in an open {action.upper()} trade. Duplicate entry skipped.",
+                        "active_trade": active_trade,
+                    })
+                    return
+                # Block any entry while a trade is open — only X markers (close_buy/close_sell) should close trades.
+                self.respond_json(HTTPStatus.OK, {
+                    "status": "blocked",
+                    "detail": f"Trade already open ({active_side.upper()}). New {action.upper()} entry blocked — close current trade first via exit signal.",
+                    "active_trade": active_trade,
+                })
                 return
+
             try:
                 result = place_market_order(symbol, action, lot, sl=None, tp=None)
             except Exception as error:
@@ -4336,6 +4370,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if result.get("status") == "placed":
                 AUTOTRADE_STATE["trade_active"] = True
                 AUTOTRADE_STATE["trade_seen_open"] = False
+                try:
+                    sync_autotrade_lifecycle()
+                except Exception:
+                    pass
                 append_ai_logic_audit(build_ai_logic_event(
                     "dbb_webhook", "opened", symbol,
                     detail=f"TradingView webhook fired {action.upper()} at {payload.get('price', '?')}. Ticket: {result.get('ticket')}",
@@ -4345,6 +4383,7 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         # --- Exit signals ---
         if action in {"close_buy", "close_sell"}:
+            target_side = "buy" if action == "close_buy" else "sell"
             active_trade = AUTOTRADE_STATE.get("active_trade")
             if not active_trade or not AUTOTRADE_STATE.get("trade_active"):
                 self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": "No open trade to close."})
@@ -4353,7 +4392,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             side = str(active_trade.get("side", "") or "")
             volume = float(active_trade.get("volume", lot) or lot)
             trade_symbol = str(active_trade.get("symbol", symbol) or symbol)
-            if (action == "close_buy" and side != "buy") or (action == "close_sell" and side != "sell"):
+            if side != target_side:
                 self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": f"Open trade is {side}, webhook said {action}."})
                 return
             try:
@@ -4363,9 +4402,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if result.get("status") == "closed":
                 AUTOTRADE_STATE["last_trade_at"] = time.time()
-                AUTOTRADE_STATE["trade_active"] = False
-                AUTOTRADE_STATE["trade_seen_open"] = False
-                AUTOTRADE_STATE["active_trade"] = None
+                try:
+                    sync_autotrade_lifecycle()
+                except Exception:
+                    AUTOTRADE_STATE["trade_active"] = False
+                    AUTOTRADE_STATE["trade_seen_open"] = False
+                    AUTOTRADE_STATE["active_trade"] = None
                 append_ai_logic_audit(build_ai_logic_event(
                     "dbb_webhook", "closed", trade_symbol,
                     detail=f"TradingView webhook fired {action} at {payload.get('price', '?')}. Ticket: {ticket}",
