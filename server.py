@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -26,6 +27,11 @@ FRONTEND_ROOT = NEURAL_APP_DIST if NEURAL_APP_DIST.exists() else ROOT
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
 MARKET_TIMEZONE = timezone.utc
 BROKER_OFFSET_FALLBACK_SECONDS = 3 * 60 * 60
+DBB_FIXED_STOP_DISTANCE = 18.0
+DBB_EXPAND_THRESH = 1.04
+DBB_MIN_HOLD_BARS = 3
+DBB_TREND_LOOKBACK_BARS = 8
+DBB_MIN_BREAKOUT_WIDTH_RATIO = 0.08
 TIMEFRAME_MAP = {
     "M1": mt5.TIMEFRAME_M1,
     "M5": mt5.TIMEFRAME_M5,
@@ -33,6 +39,14 @@ TIMEFRAME_MAP = {
     "M30": mt5.TIMEFRAME_M30,
     "H1": mt5.TIMEFRAME_H1,
     "H4": mt5.TIMEFRAME_H4,
+}
+TIMEFRAME_SECONDS = {
+    "M1": 60,
+    "M5": 5 * 60,
+    "M15": 15 * 60,
+    "M30": 30 * 60,
+    "H1": 60 * 60,
+    "H4": 4 * 60 * 60,
 }
 FULL_HISTORY_CHUNK = 1000
 RECENT_SYNC_BARS = 8
@@ -45,14 +59,57 @@ SHEET_SYNC_STATE_PATH = ROOT / "google_sheet_sync_state.json"
 SNAPSHOT_DIR = ROOT / "snapshots"
 LATEST_BOARD_IMAGE_PATH = SNAPSHOT_DIR / "latest-board.png"
 MANUAL_NEWS_CALENDAR_PATH = ROOT / "manual_news_calendar.json"
+TRADING_ECONOMICS_CALENDAR_CACHE_PATH = ROOT / "tradingeconomics_calendar_cache.json"
 DEFAULT_NEWS_BLOCK_BEFORE_MINUTES = 20
 DEFAULT_NEWS_BLOCK_AFTER_MINUTES = 20
 MANUAL_NEWS_BLOCK_MINUTES = 45
+TRADING_ECONOMICS_API_KEY = (os.environ.get("TRADING_ECONOMICS_API_KEY") or os.environ.get("TE_API_KEY") or "").strip()
+TRADING_ECONOMICS_COUNTRIES = [
+    country.strip()
+    for country in os.environ.get("TRADING_ECONOMICS_COUNTRIES", "United States").split(",")
+    if country.strip()
+]
+try:
+    TRADING_ECONOMICS_MIN_IMPORTANCE = int(os.environ.get("TRADING_ECONOMICS_MIN_IMPORTANCE", "2") or 2)
+except ValueError:
+    TRADING_ECONOMICS_MIN_IMPORTANCE = 2
+try:
+    TRADING_ECONOMICS_CACHE_SECONDS = int(os.environ.get("TRADING_ECONOMICS_CACHE_SECONDS", str(4 * 60 * 60)) or 4 * 60 * 60)
+except ValueError:
+    TRADING_ECONOMICS_CACHE_SECONDS = 4 * 60 * 60
+NEWS_CALENDAR_KEYWORDS = (
+    "fomc",
+    "fed ",
+    "federal reserve",
+    "interest rate",
+    "economic projections",
+    "powell",
+    "cpi",
+    "ppi",
+    "non farm",
+    "nonfarm",
+    "nfp",
+    "payroll",
+    "unemployment",
+    "average hourly earnings",
+    "retail sales",
+    "gdp",
+    "ism",
+    "pmi",
+    "jobless claims",
+    "jolts",
+    "pce",
+    "consumer confidence",
+    "michigan",
+    "durable goods",
+)
 AUTOTRADE_STATE = {
     "enabled": False,
     "lot": 0.10,
     "last_signal_id": "",
     "last_attempt_at": 0.0,
+    "last_verdict_key": "",
+    "last_verdict_at": 0.0,
     "last_trade_at": 0.0,
     "trade_active": False,
     "trade_seen_open": False,
@@ -61,7 +118,19 @@ AUTOTRADE_STATE = {
 }
 AUTOTRADE_LOCK = threading.RLock()
 MT5_LOCK = threading.Lock()
+AI_LOGIC_AUDIT_LOCK = threading.RLock()
 AUTOTRADE_COOLDOWN_SECONDS = 0
+SERVER_SMC_INTERVAL_SECONDS = 10
+SERVER_SMC_SYMBOL = os.environ.get("SERVER_SMC_SYMBOL", "XAUUSD").strip() or "XAUUSD"
+SERVER_SMC_MODEL = "server-smc-june10-reconstructed"
+SERVER_SMC_CONTEXT_BARS = 500
+SERVER_SMC_ENABLE_BOS_CONTINUATION = False
+SERVER_SMC_ALLOW_SAME_SIGNAL_REENTRY = True
+SERVER_SMC_STATE = {
+    "last_run_at": 0.0,
+    "last_status": "",
+    "last_detail": "",
+}
 DEAL_ENTRY_OUT = getattr(mt5, "DEAL_ENTRY_OUT", 1)
 DEAL_ENTRY_OUT_BY = getattr(mt5, "DEAL_ENTRY_OUT_BY", 3)
 DEAL_ENTRY_INOUT = getattr(mt5, "DEAL_ENTRY_INOUT", 2)
@@ -164,7 +233,7 @@ def _normalize_news_time(value: object) -> str:
         return ""
 
 
-def normalize_manual_news_event(payload: object) -> dict[str, str] | None:
+def normalize_manual_news_event(payload: object) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     date_text = str(payload.get("date", "") or "").strip()
@@ -177,12 +246,19 @@ def normalize_manual_news_event(payload: object) -> dict[str, str] | None:
     except ValueError:
         return None
     event_id = str(payload.get("id", "") or "").strip() or uuid.uuid4().hex
-    return {
+    normalized: dict[str, object] = {
         "id": event_id,
         "date": date_text,
         "time": time_text,
         "title": title[:120],
     }
+    for key in ("source", "country", "importance", "category", "event", "actual", "forecast", "previous", "block_mode"):
+        value = payload.get(key)
+        if value is not None and value != "":
+            normalized[key] = value
+    if "source" not in normalized:
+        normalized["block_mode"] = str(normalized.get("block_mode", "until_next_day") or "until_next_day")
+    return normalized
 
 
 def normalize_manual_news_calendar(payload: object) -> dict[str, object]:
@@ -214,29 +290,217 @@ def load_manual_news_calendar() -> dict[str, object]:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         return default_manual_news_calendar()
-    return normalize_manual_news_calendar(payload)
+    normalized = normalize_manual_news_calendar(payload)
+    pruned = prune_manual_news_calendar(normalized, get_dashboard_now())
+    if len(pruned.get("events", [])) != len(normalized.get("events", [])):
+        try:
+            MANUAL_NEWS_CALENDAR_PATH.write_text(json.dumps(pruned, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    return pruned
 
 
 def save_manual_news_calendar(payload: object) -> dict[str, object]:
     normalized = normalize_manual_news_calendar(payload)
     current = get_dashboard_now()
-    existing_calendar = load_manual_news_calendar()
-    existing_ids = {
-        str(item.get("id", "") or "").strip()
-        for item in existing_calendar.get("events", [])
-        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
-    }
-    normalized["events"] = [
-        item
-        for item in normalized["events"]
-        if parse_manual_news_event_dt(str(item["date"]), str(item["time"])) >= current or str(item.get("id", "") or "").strip() in existing_ids
-    ]
+    normalized = prune_manual_news_calendar(normalized, current)
     MANUAL_NEWS_CALENDAR_PATH.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
     return normalized
 
 
 def parse_manual_news_event_dt(date_text: str, time_text: str) -> datetime:
     return datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M").replace(tzinfo=MARKET_TIMEZONE)
+
+
+def next_market_day_start(dt: datetime) -> datetime:
+    return (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def prune_manual_news_calendar(calendar_state: dict[str, object], current: datetime) -> dict[str, object]:
+    events = []
+    for item in calendar_state.get("events", []) if isinstance(calendar_state.get("events"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            event_dt = parse_manual_news_event_dt(str(item["date"]), str(item["time"]))
+        except (KeyError, ValueError):
+            continue
+        is_api_event = str(item.get("source", "") or "").strip().lower() == "trading economics"
+        if is_api_event:
+            events.append(item)
+            continue
+        if current < next_market_day_start(event_dt):
+            events.append(item)
+    return {
+        **calendar_state,
+        "events": events,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _parse_trading_economics_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(MARKET_TIMEZONE) + (get_dashboard_now() - datetime.now(MARKET_TIMEZONE))
+
+
+def _trading_economics_importance(payload: dict[str, object]) -> int:
+    for key in ("Importance", "importance"):
+        try:
+            return int(float(str(payload.get(key, "0") or "0")))
+        except ValueError:
+            continue
+    return 0
+
+
+def _is_gold_relevant_news(payload: dict[str, object]) -> bool:
+    country = str(payload.get("Country", payload.get("country", "")) or "").strip().lower()
+    if TRADING_ECONOMICS_COUNTRIES and country not in {item.lower() for item in TRADING_ECONOMICS_COUNTRIES}:
+        return False
+    importance = _trading_economics_importance(payload)
+    if importance < TRADING_ECONOMICS_MIN_IMPORTANCE:
+        return False
+    searchable = " ".join(
+        str(payload.get(key, "") or "")
+        for key in ("Event", "event", "Category", "category", "Ticker", "ticker")
+    ).lower()
+    return importance >= 3 or any(keyword in searchable for keyword in NEWS_CALENDAR_KEYWORDS)
+
+
+def _normalize_trading_economics_event(payload: dict[str, object]) -> dict[str, object] | None:
+    event_dt = _parse_trading_economics_datetime(payload.get("Date") or payload.get("date"))
+    event_name = str(payload.get("Event", payload.get("event", "")) or "").strip()
+    country = str(payload.get("Country", payload.get("country", "")) or "").strip()
+    if event_dt is None or not event_name:
+        return None
+    currency = "USD" if country.lower() == "united states" else country
+    title = f"{currency} {event_name}".strip()
+    return normalize_manual_news_event(
+        {
+            "id": f"te-{event_dt.strftime('%Y%m%d%H%M')}-{country.lower().replace(' ', '-')}-{event_name.lower().replace(' ', '-')[:48]}",
+            "date": event_dt.strftime("%Y-%m-%d"),
+            "time": event_dt.strftime("%H:%M"),
+            "title": title,
+            "source": "Trading Economics",
+            "country": country,
+            "importance": _trading_economics_importance(payload),
+            "category": str(payload.get("Category", payload.get("category", "")) or "").strip(),
+            "event": event_name,
+            "actual": payload.get("Actual", payload.get("actual", "")),
+            "forecast": payload.get("Forecast", payload.get("forecast", "")),
+            "previous": payload.get("Previous", payload.get("previous", "")),
+        }
+    )
+
+
+def _read_trading_economics_cache() -> dict[str, object] | None:
+    try:
+        return json.loads(TRADING_ECONOMICS_CALENDAR_CACHE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_trading_economics_cache(payload: dict[str, object]) -> None:
+    try:
+        TRADING_ECONOMICS_CALENDAR_CACHE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_trading_economics_calendar(now: datetime | None = None) -> dict[str, object]:
+    current = now or get_dashboard_now()
+    provider_state: dict[str, object] = {
+        "provider": "tradingeconomics",
+        "enabled": bool(TRADING_ECONOMICS_API_KEY),
+        "error": "",
+        "cache_hit": False,
+        "events": [],
+        "updated_at": "",
+        "countries": TRADING_ECONOMICS_COUNTRIES,
+        "min_importance": TRADING_ECONOMICS_MIN_IMPORTANCE,
+    }
+    if not TRADING_ECONOMICS_API_KEY:
+        provider_state["error"] = "TRADING_ECONOMICS_API_KEY is not configured."
+        return provider_state
+
+    cached = _read_trading_economics_cache()
+    if isinstance(cached, dict):
+        updated_text = str(cached.get("updated_at", "") or "")
+        try:
+            updated_at = datetime.fromisoformat(updated_text)
+        except ValueError:
+            updated_at = None
+        if updated_at is not None and datetime.now(timezone.utc) - updated_at < timedelta(seconds=TRADING_ECONOMICS_CACHE_SECONDS):
+            cached["cache_hit"] = True
+            return cached
+
+    start_date = current.date().isoformat()
+    end_date = (current + timedelta(days=1)).date().isoformat()
+    country_path = quote(",".join(TRADING_ECONOMICS_COUNTRIES) or "All", safe=",")
+    credential = quote(TRADING_ECONOMICS_API_KEY, safe=":")
+    url = f"https://api.tradingeconomics.com/calendar/country/{country_path}/{start_date}/{end_date}?c={credential}&f=json"
+
+    try:
+        request = Request(url, headers={"User-Agent": "Quantum-News-Filter/1.0"})
+        with urlopen(request, timeout=10) as response:
+            raw_payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        if isinstance(cached, dict):
+            cached["cache_hit"] = True
+            cached["error"] = f"Trading Economics refresh failed; using cache: {error}"
+            return cached
+        provider_state["error"] = f"Trading Economics refresh failed: {error}"
+        return provider_state
+
+    rows = raw_payload if isinstance(raw_payload, list) else []
+    events = []
+    for row in rows:
+        if not isinstance(row, dict) or not _is_gold_relevant_news(row):
+            continue
+        normalized = _normalize_trading_economics_event(row)
+        if normalized:
+            events.append(normalized)
+    events.sort(key=lambda item: (str(item["date"]), str(item["time"]), str(item["title"]).lower(), str(item["id"])))
+    provider_state.update(
+        {
+            "events": events,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "event_count": len(events),
+        }
+    )
+    _write_trading_economics_cache(provider_state)
+    return provider_state
+
+
+def load_combined_news_calendar(now: datetime | None = None) -> dict[str, object]:
+    manual_calendar = load_manual_news_calendar()
+    api_calendar = load_trading_economics_calendar(now)
+    events_by_key: dict[tuple[str, str, str], dict[str, object]] = {}
+    for source in (manual_calendar, api_calendar):
+        for item in source.get("events", []) if isinstance(source.get("events"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            key = (str(item.get("date", "")), str(item.get("time", "")), str(item.get("title", "")).lower())
+            if all(key):
+                events_by_key[key] = item
+    events = sorted(events_by_key.values(), key=lambda item: (str(item["date"]), str(item["time"]), str(item["title"]).lower(), str(item["id"])))
+    return {
+        "before_minutes": MANUAL_NEWS_BLOCK_MINUTES,
+        "after_minutes": MANUAL_NEWS_BLOCK_MINUTES,
+        "events": events,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "manual_event_count": len(manual_calendar.get("events", [])) if isinstance(manual_calendar.get("events"), list) else 0,
+        "api_event_count": len(api_calendar.get("events", [])) if isinstance(api_calendar.get("events"), list) else 0,
+        "provider_status": {key: value for key, value in api_calendar.items() if key != "events"},
+    }
 
 
 def build_manual_news_calendar_status(payload: object, now: datetime | None = None) -> dict[str, object]:
@@ -250,13 +514,22 @@ def build_manual_news_calendar_status(payload: object, now: datetime | None = No
 
     for item in calendar_state["events"]:
         event_dt = parse_manual_news_event_dt(str(item["date"]), str(item["time"]))
-        block_start = event_dt - timedelta(minutes=before_minutes)
-        block_end = event_dt + timedelta(minutes=after_minutes)
+        is_api_event = str(item.get("source", "") or "").strip().lower() == "trading economics"
+        block_mode = str(item.get("block_mode", "") or "").strip().lower()
+        if is_api_event and block_mode != "until_next_day":
+            block_start = event_dt - timedelta(minutes=before_minutes)
+            block_end = event_dt + timedelta(minutes=after_minutes)
+            block_label = "window"
+        else:
+            block_start = event_dt
+            block_end = next_market_day_start(event_dt)
+            block_label = "until_next_day"
         event_payload = {
             **item,
             "event_at": event_dt.strftime("%Y-%m-%d %H:%M"),
             "block_start": block_start.strftime("%Y-%m-%d %H:%M"),
             "block_end": block_end.strftime("%Y-%m-%d %H:%M"),
+            "block_mode": block_label,
             "minutes_until": int((event_dt - current).total_seconds() // 60),
         }
         if block_start <= current <= block_end:
@@ -277,6 +550,15 @@ def build_manual_news_calendar_status(payload: object, now: datetime | None = No
         "active_event": active_event,
         "upcoming_event": upcoming_event,
     }
+
+
+def build_news_calendar_status(now: datetime | None = None) -> dict[str, object]:
+    calendar_state = load_combined_news_calendar(now)
+    status = build_manual_news_calendar_status(calendar_state, now)
+    status["manual_event_count"] = calendar_state.get("manual_event_count", 0)
+    status["api_event_count"] = calendar_state.get("api_event_count", 0)
+    status["provider_status"] = calendar_state.get("provider_status", {})
+    return status
 
 
 
@@ -413,10 +695,15 @@ def save_ai_decision_log(entry: dict[str, object]) -> None:
 
 
 def append_ai_logic_audit(entry: dict[str, object]) -> None:
-    rows = load_ai_logic_audit()
-    rows.append(entry)
-    rows = sorted(rows, key=lambda row: str(row.get("logged_at", "")), reverse=True)[:10000]
-    AI_LOGIC_AUDIT_PATH.write_text(json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8")
+    # Several background workers write audit events. Serialize their read-modify-write
+    # cycle and replace the file atomically so diagnostics cannot silently lose events.
+    with AI_LOGIC_AUDIT_LOCK:
+        rows = load_ai_logic_audit()
+        rows.append(entry)
+        rows = sorted(rows, key=lambda row: str(row.get("logged_at", "")), reverse=True)[:10000]
+        temp_path = AI_LOGIC_AUDIT_PATH.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8")
+        temp_path.replace(AI_LOGIC_AUDIT_PATH)
 
 
 def load_last_sheet_sync_ticket() -> int:
@@ -2231,25 +2518,43 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
     l2 = bb2_now["lower"]
     basis = bb_now["basis"]
 
-    # Expansion filter: bands must be widening (matches TradingView expandThresh=1.02)
+    # Expansion filter: bands must be widening strongly enough to avoid weak chop.
     bb_width_now  = bb_now["width"]
     bb_width_prev = bb_prev["width"]
-    expanding = bb_width_now > bb_width_prev * 1.02
+    expanding = bb_width_now > bb_width_prev * DBB_EXPAND_THRESH
+
+    basis_then = None
+    if len(m15_candles) > DBB_TREND_LOOKBACK_BARS + 20:
+        bb_trend = compute_bollinger_band(
+            m15_candles,
+            period=20,
+            std_dev=1.0,
+            source="close",
+            offset=DBB_TREND_LOOKBACK_BARS,
+        )
+        if bb_trend is not None:
+            basis_then = bb_trend["basis"]
+    basis_rising = basis_then is not None and basis > basis_then
+    basis_falling = basis_then is not None and basis < basis_then
+    min_breakout_distance = bb_width_now * DBB_MIN_BREAKOUT_WIDTH_RATIO
 
     # Entry window: no new entries at or after 22:00 broker time
     broker_hour = datetime.now(MARKET_TIMEZONE).hour
     entry_window_open = broker_hour < 22
 
     # Crossover / crossunder detection (Pine-style)
-    crossed_above_u1 = prev_close <= prev_u1 and last_close > u1 and expanding
-    crossed_below_l1 = prev_close >= prev_l1 and last_close < l1 and expanding
+    crossed_above_u1_raw = prev_close <= prev_u1 and last_close > u1
+    crossed_below_l1_raw = prev_close >= prev_l1 and last_close < l1
+    long_breakout_ok = last_close >= u1 + min_breakout_distance
+    short_breakout_ok = last_close <= l1 - min_breakout_distance
+    crossed_above_u1 = crossed_above_u1_raw and expanding and basis_rising and long_breakout_ok
+    crossed_below_l1 = crossed_below_l1_raw and expanding and basis_falling and short_breakout_ok
 
-    # Min hold bars: block exit for 5 M15 bars (75 min) after entry
+    # Min hold bars: reduced so failed momentum exits faster.
     M15_BAR_SECONDS = 15 * 60
-    MIN_HOLD_BARS = 5
     trade_entry_at = float(AUTOTRADE_STATE.get("dbb_entry_at", 0.0) or 0.0)
     bars_held = int((time.time() - trade_entry_at) / M15_BAR_SECONDS) if trade_entry_at > 0 else 0
-    min_hold_ok = bars_held >= MIN_HOLD_BARS
+    min_hold_ok = bars_held >= DBB_MIN_HOLD_BARS
 
     # Record entry time when a new signal fires
     if crossed_above_u1 or crossed_below_l1:
@@ -2265,21 +2570,40 @@ def build_local_trade_setup(board: dict[str, object]) -> dict[str, object]:
         "l1": l1,
         "l2": l2,
         "expanding": expanding,
+        "expandThreshold": DBB_EXPAND_THRESH,
         "bbWidthNow": bb_width_now,
         "bbWidthPrev": bb_width_prev,
+        "basisThen": basis_then,
+        "basisRising": basis_rising,
+        "basisFalling": basis_falling,
+        "minBreakoutDistance": min_breakout_distance,
+        "longBreakoutOk": long_breakout_ok,
+        "shortBreakoutOk": short_breakout_ok,
         "barsHeld": bars_held,
         "minHoldOk": min_hold_ok,
-        "crossedAboveU1": crossed_above_u1,
-        "crossedBelowL1": crossed_below_l1,
+        "minHoldBars": DBB_MIN_HOLD_BARS,
+        "crossedAboveU1": crossed_above_u1_raw,
+        "crossedBelowL1": crossed_below_l1_raw,
+        "longSignalAllowed": crossed_above_u1,
+        "shortSignalAllowed": crossed_below_l1,
     }
 
     why: list[str] = [
         f"DBB M15: basis {basis:.2f}, 1SD {l1:.2f}-{u1:.2f}, 2SD {l2:.2f}-{u2:.2f}",
         f"Bands {'expanding' if expanding else 'flat'}: width {bb_width_now:.2f} vs prev {bb_width_prev:.2f}",
+        f"Basis slope filter: {'rising' if basis_rising else 'falling' if basis_falling else 'flat/unknown'} over {DBB_TREND_LOOKBACK_BARS} bars",
     ]
     conflicts: list[str] = []
     if not expanding:
         conflicts.append("Bands not expanding - entry blocked per expansion filter")
+    if crossed_above_u1_raw and not basis_rising:
+        conflicts.append("Long cross blocked - DBB basis is not rising")
+    if crossed_below_l1_raw and not basis_falling:
+        conflicts.append("Short cross blocked - DBB basis is not falling")
+    if crossed_above_u1_raw and not long_breakout_ok:
+        conflicts.append("Long cross blocked - close did not clear u1 by minimum breakout distance")
+    if crossed_below_l1_raw and not short_breakout_ok:
+        conflicts.append("Short cross blocked - close did not clear l1 by minimum breakout distance")
     if bias == "bullish":
         why.append("M15 structure leans bullish")
     elif bias == "bearish":
@@ -2719,10 +3043,10 @@ def evaluate_autotrade_signal(
             detail = "Auto trade is disabled."
             log_autotrade("autotrade_dispatch", "disabled", detail)
             return HTTPStatus.OK.value, {"status": "disabled", "detail": detail}
-        news_calendar_status = build_manual_news_calendar_status(load_manual_news_calendar())
+        news_calendar_status = build_news_calendar_status()
         if bool(news_calendar_status.get("blocked")):
             active_event = news_calendar_status.get("active_event") if isinstance(news_calendar_status.get("active_event"), dict) else {}
-            detail = f"Manual news block active for {str(active_event.get('title', 'scheduled event') or 'scheduled event')}."
+            detail = f"News block active for {str(active_event.get('title', 'scheduled event') or 'scheduled event')}."
             log_autotrade("autotrade_dispatch", "news_block", detail, news_event=active_event)
             return HTTPStatus.OK.value, {
                 "status": "news_block",
@@ -2730,7 +3054,18 @@ def evaluate_autotrade_signal(
                 "news_calendar": news_calendar_status,
             }
         now = time.time()
-        if signal_id and signal_id == AUTOTRADE_STATE["last_signal_id"]:
+        cooldown_remaining = get_cooldown_remaining_seconds()
+        if cooldown_remaining > 0:
+            detail = f"Auto trade cooldown active for {cooldown_remaining} more seconds."
+            log_autotrade("autotrade_dispatch", "cooldown", detail, cooldown_remaining_seconds=cooldown_remaining)
+            return HTTPStatus.OK.value, {
+                "status": "cooldown",
+                "detail": detail,
+                "cooldown_remaining_seconds": cooldown_remaining,
+                "cooldown_seconds": AUTOTRADE_COOLDOWN_SECONDS,
+            }
+        allow_same_signal_reentry = SERVER_SMC_ALLOW_SAME_SIGNAL_REENTRY and action == "server_smc_june10_reconstructed"
+        if signal_id and signal_id == AUTOTRADE_STATE["last_signal_id"] and not allow_same_signal_reentry:
             detail = "Signal already processed."
             log_autotrade("autotrade_dispatch", "duplicate", detail)
             return HTTPStatus.OK.value, {"status": "duplicate", "detail": detail}
@@ -2778,6 +3113,7 @@ def evaluate_autotrade_signal(
                         "trigger_summary": str(ai_trade_payload.get("trigger_summary", "")).strip(),
                         "execution_summary": str(ai_trade_payload.get("execution_summary", "")).strip(),
                         "model": str(ai_trade_payload.get("model", "")).strip(),
+                        "strategy_version": str(ai_trade_payload.get("strategy_version", "")).strip(),
                     }
                 )
     return HTTPStatus.OK.value, result
@@ -2892,6 +3228,19 @@ def fetch_candles(symbol: str, timeframe: str, limit: int | None) -> tuple[str, 
             return resolved_symbol, candles
         finally:
             mt5.shutdown()
+
+
+def closed_candle_window(candles: list[dict[str, float | int]], timeframe: str) -> list[dict[str, float | int]]:
+    if not candles:
+        return []
+    seconds = TIMEFRAME_SECONDS.get(timeframe.upper())
+    if not seconds:
+        return candles
+    broker_now_epoch = int(get_dashboard_now().timestamp())
+    latest_open = int(_num(candles[-1].get("time")))
+    if latest_open > 0 and latest_open + seconds > broker_now_epoch:
+        return candles[:-1]
+    return candles
 
 
 def trend_summary(candles: list[dict[str, float | int]]) -> dict[str, str | float]:
@@ -3147,6 +3496,533 @@ def calculate_atr(candles: list[dict[str, float | int]], period: int = 14) -> fl
     return atr
 
 
+def _num(value: object, fallback: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if math.isfinite(parsed) else fallback
+
+
+def _fmt_price(value: object) -> str:
+    parsed = _num(value, float("nan"))
+    return "--" if not math.isfinite(parsed) else f"{parsed:.2f}"
+
+
+SMC_MAX_SL_INDEX = 20.0
+SMC_MAX_TP_INDEX = 20.0
+SMC_MIN_SL_INDEX = 3.0
+SMC_MIN_TP_INDEX = 3.0
+
+
+def smc_trade_distances_ok(entry: float, sl: float, tp: float) -> bool:
+    risk_distance = abs(entry - sl)
+    reward_distance = abs(entry - tp)
+    return (
+        SMC_MIN_SL_INDEX <= risk_distance <= SMC_MAX_SL_INDEX
+        and SMC_MIN_TP_INDEX <= reward_distance <= SMC_MAX_TP_INDEX
+    )
+
+
+def smc_liquidity_target(candles: list[dict[str, float | int]], side: str, entry: float, atr: float) -> float | None:
+    if not candles or atr <= 0:
+        return None
+    min_reward = max(SMC_MIN_TP_INDEX, atr * 0.35)
+    max_reward = SMC_MAX_TP_INDEX
+    front_run = min(max(atr * 0.12, 0.35), 1.0)
+    window = candles[-min(96, len(candles)):]
+    raw_levels: list[float] = []
+    try:
+        swings = smc_detect_swings(window, 3, 3)
+    except Exception:
+        swings = []
+    if side == "sell":
+        raw_levels.extend(_num(point.get("price")) for point in swings if point.get("type") == "low")
+        raw_levels.extend(_num(candle.get("low")) for candle in window[-64:])
+        candidates = []
+        for level in raw_levels:
+            tp = level + front_run
+            distance = entry - tp
+            if min_reward <= distance <= max_reward:
+                candidates.append((distance, tp))
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
+    if side == "buy":
+        raw_levels.extend(_num(point.get("price")) for point in swings if point.get("type") == "high")
+        raw_levels.extend(_num(candle.get("high")) for candle in window[-64:])
+        candidates = []
+        for level in raw_levels:
+            tp = level - front_run
+            distance = tp - entry
+            if min_reward <= distance <= max_reward:
+                candidates.append((distance, tp))
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
+    return None
+
+
+def smc_market_day_key(timestamp: object) -> str:
+    try:
+        ts = int(float(timestamp))
+    except (TypeError, ValueError):
+        ts = 0
+    # MT5 rate timestamps already use the broker clock in this feed. Adding
+    # the inferred broker offset again would move the day boundary to 21:00.
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+
+def smc_current_market_day_candles(candles: list[dict[str, float | int]]) -> list[dict[str, float | int]]:
+    if not candles:
+        return []
+    latest_key = smc_market_day_key(candles[-1].get("time"))
+    return [candle for candle in candles if smc_market_day_key(candle.get("time")) == latest_key]
+
+
+def smc_detect_swings(candles: list[dict[str, float | int]], left: int = 4, right: int = 4) -> list[dict[str, object]]:
+    swings: list[dict[str, object]] = []
+    if len(candles) < left + right + 3:
+        return swings
+    for index in range(left, len(candles) - right):
+        high = _num(candles[index].get("high"))
+        low = _num(candles[index].get("low"))
+        is_high = True
+        is_low = True
+        for offset in range(index - left, index + right + 1):
+            if offset == index:
+                continue
+            if _num(candles[offset].get("high")) >= high:
+                is_high = False
+            if _num(candles[offset].get("low")) <= low:
+                is_low = False
+            if not is_high and not is_low:
+                break
+        if is_high:
+            swings.append({"index": index, "time": int(_num(candles[index].get("time"))), "type": "high", "price": high})
+        if is_low:
+            swings.append({"index": index, "time": int(_num(candles[index].get("time"))), "type": "low", "price": low})
+    return swings
+
+
+def smc_detect_events(candles: list[dict[str, float | int]], swings: list[dict[str, object]]) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    highs = [point for point in swings if point.get("type") == "high"]
+    lows = [point for point in swings if point.get("type") == "low"]
+    trend = "range"
+    last_broken_high: float | None = None
+    last_broken_low: float | None = None
+    for index, candle in enumerate(candles):
+        prior_high = next((point for point in reversed(highs) if int(point["index"]) < index), None)
+        prior_low = next((point for point in reversed(lows) if int(point["index"]) < index), None)
+        if not prior_high or not prior_low:
+            continue
+        close = _num(candle.get("close"))
+        high = _num(candle.get("high"))
+        low = _num(candle.get("low"))
+        prior_high_price = _num(prior_high.get("price"))
+        prior_low_price = _num(prior_low.get("price"))
+        if high > prior_high_price and close < prior_high_price:
+            events.append({"index": index, "time": int(_num(candle.get("time"))), "sourceIndex": prior_high["index"], "sourceTime": prior_high["time"], "type": "sweep_high", "label": "SWEEP", "direction": "bearish", "price": prior_high_price})
+        if low < prior_low_price and close > prior_low_price:
+            events.append({"index": index, "time": int(_num(candle.get("time"))), "sourceIndex": prior_low["index"], "sourceTime": prior_low["time"], "type": "sweep_low", "label": "SWEEP", "direction": "bullish", "price": prior_low_price})
+        if close > prior_high_price and last_broken_high != prior_high_price:
+            is_choch = trend == "bearish"
+            events.append({"index": index, "time": int(_num(candle.get("time"))), "sourceIndex": prior_high["index"], "sourceTime": prior_high["time"], "type": "choch_up" if is_choch else "bos_up", "label": "CHoCH" if is_choch else "BOS", "direction": "bullish", "price": prior_high_price})
+            trend = "bullish"
+            last_broken_high = prior_high_price
+        if close < prior_low_price and last_broken_low != prior_low_price:
+            is_choch = trend == "bullish"
+            events.append({"index": index, "time": int(_num(candle.get("time"))), "sourceIndex": prior_low["index"], "sourceTime": prior_low["time"], "type": "choch_down" if is_choch else "bos_down", "label": "CHoCH" if is_choch else "BOS", "direction": "bearish", "price": prior_low_price})
+            trend = "bearish"
+            last_broken_low = prior_low_price
+    return events
+
+
+def smc_atr(candles: list[dict[str, float | int]], period: int = 14) -> float:
+    if len(candles) < period + 1:
+        return 0.0
+    true_ranges = []
+    for index in range(1, len(candles)):
+        high = _num(candles[index].get("high"))
+        low = _num(candles[index].get("low"))
+        previous_close = _num(candles[index - 1].get("close"))
+        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    sample = true_ranges[-period:]
+    return sum(sample) / len(sample) if sample else 0.0
+
+
+def smc_fvgs(candles: list[dict[str, float | int]], side: str | None = None) -> list[dict[str, object]]:
+    if len(candles) < 3:
+        return []
+    gaps: list[dict[str, object]] = []
+    min_gap = max(0.5, smc_atr(candles) * 0.12)
+    for index in range(2, len(candles)):
+        two_back = candles[index - 2]
+        current = candles[index]
+        bull_low = _num(two_back.get("high"))
+        bull_high = _num(current.get("low"))
+        bear_high = _num(two_back.get("low"))
+        bear_low = _num(current.get("high"))
+        if (side in {None, "buy"}) and bull_high - bull_low >= min_gap:
+            midpoint = (bull_low + bull_high) / 2
+            filled = any(_num(candle.get("low")) <= midpoint for candle in candles[index + 1:])
+            gaps.append({"startIndex": index - 2, "endIndex": min(index + 24, len(candles) - 1), "startTime": int(_num(two_back.get("time"))), "endTime": int(_num(candles[min(index + 24, len(candles) - 1)].get("time"))), "high": bull_high, "low": bull_low, "midpoint": midpoint, "filled": filled, "type": "buy"})
+        if (side in {None, "sell"}) and bear_high - bear_low >= min_gap:
+            midpoint = (bear_low + bear_high) / 2
+            filled = any(_num(candle.get("high")) >= midpoint for candle in candles[index + 1:])
+            gaps.append({"startIndex": index - 2, "endIndex": min(index + 24, len(candles) - 1), "startTime": int(_num(two_back.get("time"))), "endTime": int(_num(candles[min(index + 24, len(candles) - 1)].get("time"))), "high": bear_high, "low": bear_low, "midpoint": midpoint, "filled": filled, "type": "sell"})
+    return [gap for gap in gaps if not bool(gap.get("filled"))][-20:]
+
+
+def smc_fib(candles: list[dict[str, float | int]], preferred_direction: str = "range") -> dict[str, object] | None:
+    swings = smc_detect_swings(candles, 6, 6)
+    if len(swings) < 2:
+        return None
+    atr = smc_atr(candles)
+    min_move = max(atr * 2.2, 8)
+    candidates: list[dict[str, object]] = []
+    for end_index in range(len(swings) - 1, 0, -1):
+        end = swings[end_index]
+        start = next((point for point in reversed(swings[:end_index]) if point.get("type") != end.get("type")), None)
+        if not start:
+            continue
+        direction = "bullish" if _num(end.get("price")) >= _num(start.get("price")) else "bearish"
+        if (direction == "bullish" and (start.get("type") != "low" or end.get("type") != "high")) or (direction == "bearish" and (start.get("type") != "high" or end.get("type") != "low")):
+            continue
+        move_size = abs(_num(end.get("price")) - _num(start.get("price")))
+        if move_size >= min_move:
+            candidates.append({"start": start, "end": end, "direction": direction, "moveSize": move_size})
+    selected = None if preferred_direction == "range" else next((item for item in candidates if item["direction"] == preferred_direction), None)
+    selected = selected or (candidates[0] if candidates else None)
+    if not selected:
+        return None
+    start = selected["start"]
+    end = selected["end"]
+    move = _num(end["price"]) - _num(start["price"])
+    direction = "bullish" if move >= 0 else "bearish"
+    ratios = [("0.000", 0), ("0.382", 0.382), ("0.500", 0.5), ("0.618", 0.618), ("0.705", 0.705), ("0.786", 0.786), ("1.000", 1)]
+    levels = [{"key": key, "ratio": ratio, "price": _num(end["price"]) - move * ratio} for key, ratio in ratios]
+    level382 = next(level["price"] for level in levels if level["key"] == "0.382")
+    level786 = next(level["price"] for level in levels if level["key"] == "0.786")
+    last_close = _num(candles[-1].get("close"), _num(end["price"]))
+    bars_since_end = max(0, len(candles) - 1 - int(end["index"]))
+    moved_past_end = last_close < _num(end["price"]) - max(atr * 0.25, abs(move) * 0.04) if direction == "bearish" else last_close > _num(end["price"]) + max(atr * 0.25, abs(move) * 0.04)
+    inside = min(level382, level786) <= last_close <= max(level382, level786)
+    too_old = bars_since_end > 72
+    status = "active" if inside and not moved_past_end and not too_old else "reference"
+    reason = "price is inside the tradable retracement zone" if status == "active" else "fib leg is old; waiting for fresh structure" if too_old else "price already extended beyond the impulse end" if moved_past_end else "price is outside the tradable retracement zone"
+    return {"startIndex": start["index"], "endIndex": end["index"], "startTime": start["time"], "endTime": end["time"], "startPrice": start["price"], "endPrice": end["price"], "direction": direction, "levels": levels, "status": status, "statusReason": reason}
+
+
+def smc_structure(candles: list[dict[str, float | int]]) -> dict[str, object]:
+    swings = smc_detect_swings(candles, 4, 4)
+    events = smc_detect_events(candles, swings)
+    structure_events = [event for event in events if event["label"] in {"BOS", "CHoCH"}]
+    major_swings = smc_detect_swings(candles, 8, 8)
+    major_events = [event for event in smc_detect_events(candles, major_swings) if event["label"] in {"BOS", "CHoCH"}]
+    latest_major_bos = next((event for event in reversed(major_events) if event["label"] == "BOS"), None)
+    latest_minor_shift = structure_events[-1] if structure_events else None
+    major_bias = str(latest_major_bos["direction"]) if latest_major_bos else "range"
+    if major_bias == "range" and len(candles) >= 20:
+        recent = candles[-min(80, len(candles)):]
+        first_close = _num(recent[0].get("close"))
+        last_close = _num(recent[-1].get("close"))
+        high = max(_num(candle.get("high")) for candle in recent)
+        low = min(_num(candle.get("low")) for candle in recent)
+        visible_range = max(high - low, 1)
+        move = last_close - first_close
+        if move > visible_range * 0.22:
+            major_bias = "bullish"
+        elif move < -visible_range * 0.22:
+            major_bias = "bearish"
+    minor_bias = str(latest_minor_shift["direction"]) if latest_minor_shift else major_bias
+    state = "range" if major_bias == "range" else "pullback" if minor_bias != major_bias else "trend"
+    return {"majorBias": major_bias, "minorBias": minor_bias, "state": state, "events": events[-100:], "fairValueGaps": smc_fvgs(candles), "fib": smc_fib(candles, major_bias)}
+
+
+def smc_fib_angle(candles: list[dict[str, float | int]], fib: dict[str, object] | None) -> dict[str, object]:
+    if not fib or fib.get("status") != "active":
+        return {"label": "Reference", "doable": False}
+    bars = max(1, abs(int(fib["endIndex"]) - int(fib["startIndex"])))
+    move = abs(_num(fib["endPrice"]) - _num(fib["startPrice"]))
+    atr = smc_atr(candles)
+    if atr <= 0:
+        return {"label": "--", "doable": False}
+    atr_per_bar = move / (atr * bars)
+    if atr_per_bar < 0.12:
+        return {"label": "Too flat", "doable": False}
+    if atr_per_bar > 1.35:
+        return {"label": "Too sharp", "doable": False}
+    return {"label": "Aggressive" if atr_per_bar > 0.75 else "Doable", "doable": True}
+
+
+def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> dict[str, object]:
+    empty = {"active": False, "label": "No Active Setup", "trigger": "", "execution": "", "side": None, "entry": None, "sl": None, "tp": None, "signalId": ""}
+    major_bias = str(smc.get("majorBias", "range"))
+    if major_bias == "range" or not candles:
+        return empty
+    atr = smc_atr(candles)
+    if atr <= 0:
+        return empty
+    last = candles[-1]
+    entry = _num(last.get("close"))
+    buffer = max(atr * 0.35, 1.2)
+    fib = smc.get("fib") if isinstance(smc.get("fib"), dict) else None
+    fib_angle = smc_fib_angle(candles, fib)
+    fib_active = bool(fib and fib.get("status") == "active" and fib_angle.get("doable") and len(candles) >= int(fib["endIndex"]) + 1)
+
+    if fib_active and fib and major_bias == "bearish" and fib.get("direction") == "bearish":
+        pullback_high = max(_num(fib["startPrice"]), _num(fib["endPrice"]))
+        pullback_low = min(_num(fib["startPrice"]), _num(fib["endPrice"]))
+        pullback_range = max(pullback_high - pullback_low, atr)
+        rejection_start = max(0, int(fib["endIndex"]) - 1)
+        rejection_window = [{**c, "index": rejection_start + i} for i, c in enumerate(candles[rejection_start:])]
+        scored = []
+        for candle in rejection_window:
+            high = _num(candle.get("high")); open_ = _num(candle.get("open")); close = _num(candle.get("close"))
+            upper_wick = high - max(open_, close)
+            if high >= pullback_low + pullback_range * 0.52 or upper_wick >= atr * 0.22:
+                scored.append((upper_wick / atr + (high - pullback_low) / pullback_range, candle, high, open_, close))
+        if scored:
+            _, rejection, rejection_high, rejection_open, rejection_close = max(scored, key=lambda item: item[0])
+            fading = entry < max(rejection_open, rejection_close)
+            if fading:
+                    sl = rejection_high + buffer
+                    risk = max(sl - entry, atr)
+                    fib_targets = sorted([_num(level["price"]) for level in fib.get("levels", []) if level.get("key") in {"0.618", "0.5", "0.382"} and _num(level.get("price")) < entry - atr * 0.2], reverse=True)
+                    common_target = pullback_low + pullback_range * 0.32
+                    tp = max(entry - risk * 1.15, fib_targets[0] if fib_targets else common_target if common_target < entry else entry - atr * 1.15)
+                    if tp < entry:
+                        live_time = int(_num(last.get("time")))
+                        return {"active": True, "label": "Sell Rejection Continuation", "trigger": f"Price is fading from the rejection wick at {_fmt_price(rejection_high)} inside the bearish SMC state; no candle close confirmation is required.", "execution": f"Sell near {_fmt_price(entry)}. SL goes above the rejection wick at {_fmt_price(sl)}. TP is a common-area target around {_fmt_price(tp)}, not the deepest liquidity point.", "side": "sell", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-sell-reject-{int(_num(rejection.get('time'), _num(fib['endTime'])))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
+
+    if fib_active and fib and major_bias == "bullish" and fib.get("direction") == "bullish":
+        pullback_high = max(_num(fib["startPrice"]), _num(fib["endPrice"]))
+        pullback_low = min(_num(fib["startPrice"]), _num(fib["endPrice"]))
+        pullback_range = max(pullback_high - pullback_low, atr)
+        rejection_start = max(0, int(fib["endIndex"]) - 1)
+        rejection_window = [{**c, "index": rejection_start + i} for i, c in enumerate(candles[rejection_start:])]
+        scored = []
+        for candle in rejection_window:
+            low = _num(candle.get("low")); open_ = _num(candle.get("open")); close = _num(candle.get("close"))
+            lower_wick = min(open_, close) - low
+            if low <= pullback_high - pullback_range * 0.52 or lower_wick >= atr * 0.22:
+                scored.append((lower_wick / atr + (pullback_high - low) / pullback_range, candle, low, open_, close))
+        if scored:
+            _, rejection, rejection_low, rejection_open, rejection_close = max(scored, key=lambda item: item[0])
+            backing = entry > min(rejection_open, rejection_close)
+            if backing:
+                    sl = rejection_low - buffer
+                    risk = max(entry - sl, atr)
+                    fib_targets = sorted([_num(level["price"]) for level in fib.get("levels", []) if level.get("key") in {"0.618", "0.5", "0.382"} and _num(level.get("price")) > entry + atr * 0.2])
+                    common_target = pullback_high - pullback_range * 0.32
+                    tp = min(entry + risk * 1.15, fib_targets[0] if fib_targets else common_target if common_target > entry else entry + atr * 1.15)
+                    if tp > entry:
+                        live_time = int(_num(last.get("time")))
+                        return {"active": True, "label": "Buy Rejection Continuation", "trigger": f"Price is backing up from the rejection wick at {_fmt_price(rejection_low)} inside the bullish SMC state; no candle close confirmation is required.", "execution": f"Buy near {_fmt_price(entry)}. SL goes below the rejection wick at {_fmt_price(sl)}. TP is a common-area target around {_fmt_price(tp)}, not the deepest liquidity point.", "side": "buy", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-buy-reject-{int(_num(rejection.get('time'), _num(fib['endTime'])))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
+
+    events = smc.get("events") if isinstance(smc.get("events"), list) else []
+    latest_bos = next((event for event in reversed(events) if event.get("label") == "BOS" and event.get("direction") == major_bias and int(event.get("index", 0)) >= len(candles) - 18), None)
+    if SERVER_SMC_ENABLE_BOS_CONTINUATION and latest_bos and int(latest_bos["index"]) < len(candles) - 1:
+        after_bos = [{**c, "index": int(latest_bos["index"]) + 1 + i} for i, c in enumerate(candles[int(latest_bos["index"]) + 1:])]
+        fresh_window = after_bos[:10]
+        recent = candles[-30:]
+        recent_low = min(_num(c.get("low")) for c in recent)
+        recent_high = max(_num(c.get("high")) for c in recent)
+        fvgs = smc.get("fairValueGaps") if isinstance(smc.get("fairValueGaps"), list) else []
+        same_side_fvgs = [gap for gap in reversed(fvgs) if gap.get("type") == ("sell" if major_bias == "bearish" else "buy") and int(gap.get("startIndex", 0)) >= int(latest_bos["index"]) - 3]
+        broken_level = _num(latest_bos["price"])
+        if major_bias == "bearish":
+            candidates = []
+            for candle in fresh_window:
+                high = _num(candle.get("high")); low = _num(candle.get("low")); open_ = _num(candle.get("open")); close = _num(candle.get("close"))
+                touched_broken = high >= broken_level - atr * 0.25
+                touched_fvg = any(high >= min(_num(g.get("high")), _num(g.get("low"))) and low <= max(_num(g.get("high")), _num(g.get("low"))) for g in same_side_fvgs)
+                upper_wick = high - max(open_, close)
+                if touched_broken or touched_fvg:
+                    candidates.append((upper_wick / atr + (1 if touched_broken else 0) + (1 if touched_fvg else 0), candle, high))
+            if candidates:
+                _, retest, retest_high = max(candidates, key=lambda item: item[0])
+                after_retest = candles[int(retest["index"]) + 1:int(retest["index"]) + 5]
+                bearish_follow = any(_num(c.get("close")) < _num(c.get("open")) or _num(c.get("close")) < broken_level - atr * 0.12 for c in after_retest)
+                if after_retest and bearish_follow and entry >= broken_level - max(atr * 2.4, 6):
+                    sl = max(retest_high, broken_level) + buffer
+                    risk = max(sl - entry, atr)
+                    common_target = recent_low - atr * 0.25 if recent_low < entry else entry - atr
+                    liquidity_target = smc_liquidity_target(candles, "sell", entry, atr)
+                    tp = liquidity_target if liquidity_target is not None else max(entry - risk * 0.95, common_target)
+                    if tp < entry and (entry - tp) / risk >= 0.8 and smc_trade_distances_ok(entry, sl, tp):
+                        confirm_time = int(_num(after_retest[-1].get("time"), _num(last.get("time"))))
+                        return {"active": True, "label": "Sell BOS Continuation Retest", "trigger": f"Fresh bearish BOS at {_fmt_price(broken_level)} was retested and price failed to reclaim it. Continuation sell is valid after bearish follow-through.", "execution": f"Sell near {_fmt_price(entry)}. SL goes above the retest wick/broken level at {_fmt_price(sl)}. TP targets nearby sell-side liquidity around {_fmt_price(tp)}.", "side": "sell", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-sell-bos-retest-{int(_num(latest_bos.get('time')))}-{int(_num(retest.get('time')))}-{confirm_time}-{round(sl * 100)}-{round(tp * 100)}"}
+        if major_bias == "bullish":
+            candidates = []
+            for candle in fresh_window:
+                high = _num(candle.get("high")); low = _num(candle.get("low")); open_ = _num(candle.get("open")); close = _num(candle.get("close"))
+                touched_broken = low <= broken_level + atr * 0.25
+                touched_fvg = any(high >= min(_num(g.get("high")), _num(g.get("low"))) and low <= max(_num(g.get("high")), _num(g.get("low"))) for g in same_side_fvgs)
+                lower_wick = min(open_, close) - low
+                if touched_broken or touched_fvg:
+                    candidates.append((lower_wick / atr + (1 if touched_broken else 0) + (1 if touched_fvg else 0), candle, low))
+            if candidates:
+                _, retest, retest_low = max(candidates, key=lambda item: item[0])
+                after_retest = candles[int(retest["index"]) + 1:int(retest["index"]) + 5]
+                bullish_follow = any(_num(c.get("close")) > _num(c.get("open")) or _num(c.get("close")) > broken_level + atr * 0.12 for c in after_retest)
+                if after_retest and bullish_follow and entry <= broken_level + max(atr * 2.4, 6):
+                    sl = min(retest_low, broken_level) - buffer
+                    risk = max(entry - sl, atr)
+                    common_target = recent_high + atr * 0.25 if recent_high > entry else entry + atr
+                    liquidity_target = smc_liquidity_target(candles, "buy", entry, atr)
+                    tp = liquidity_target if liquidity_target is not None else min(entry + risk * 0.95, common_target)
+                    if tp > entry and (tp - entry) / risk >= 0.8 and smc_trade_distances_ok(entry, sl, tp):
+                        confirm_time = int(_num(after_retest[-1].get("time"), _num(last.get("time"))))
+                        return {"active": True, "label": "Buy BOS Continuation Retest", "trigger": f"Fresh bullish BOS at {_fmt_price(broken_level)} was retested and price held it. Continuation buy is valid after bullish follow-through.", "execution": f"Buy near {_fmt_price(entry)}. SL goes below the retest wick/broken level at {_fmt_price(sl)}. TP targets nearby buy-side liquidity around {_fmt_price(tp)}.", "side": "buy", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-buy-bos-retest-{int(_num(latest_bos.get('time')))}-{int(_num(retest.get('time')))}-{confirm_time}-{round(sl * 100)}-{round(tp * 100)}"}
+
+    recent_candles = candles[-18:]
+    fvgs = smc.get("fairValueGaps") if isinstance(smc.get("fairValueGaps"), list) else []
+    touched_fvgs = []
+    for gap in reversed(fvgs):
+        high = max(_num(gap.get("high")), _num(gap.get("low")))
+        low = min(_num(gap.get("high")), _num(gap.get("low")))
+        if any(_num(c.get("high")) >= low and _num(c.get("low")) <= high for c in recent_candles):
+            touched_fvgs.append(gap)
+    matching_fvg = next((gap for gap in touched_fvgs if gap.get("type") == ("sell" if major_bias == "bearish" else "buy")), None) or (touched_fvgs[0] if touched_fvgs else None)
+    if not matching_fvg:
+        return empty
+    zone_high = max(_num(matching_fvg.get("high")), _num(matching_fvg.get("low")))
+    zone_low = min(_num(matching_fvg.get("high")), _num(matching_fvg.get("low")))
+    zone_range = max(zone_high - zone_low, atr)
+    max_chase = max(atr * 0.35, zone_range * 0.75)
+    rejection_start = max(int(matching_fvg.get("startIndex", 0)), len(candles) - 18)
+    rejection_window = [{**c, "index": rejection_start + i} for i, c in enumerate(candles[rejection_start:])]
+    if major_bias == "bearish":
+        scored = []
+        for candle in rejection_window:
+            high = _num(candle.get("high")); low = _num(candle.get("low")); open_ = _num(candle.get("open")); close = _num(candle.get("close"))
+            if high >= zone_low and low <= zone_high:
+                scored.append(((high - max(open_, close)) / max(atr, 0.01) + (1 if high >= zone_low else 0), candle, high, open_, close))
+        if scored:
+            _, rejection, rejection_high, rejection_open, rejection_close = max(scored, key=lambda item: item[0])
+            fading = entry < max(rejection_open, rejection_close)
+            if fading:
+                    sl = rejection_high + buffer
+                    risk = max(sl - entry, atr)
+                    zone_extension = min(zone_range * 0.25, atr * 1.2)
+                    common_area = min(zone_low - zone_extension, entry - atr * 0.9)
+                    tp = max(entry - risk * 1.1, min(zone_low - zone_range * 0.5, entry - atr * 1.1))
+                    if tp < entry and entry >= zone_low - max_chase:
+                        live_time = int(_num(last.get("time")))
+                        return {"active": True, "label": "Sell FVG Rejection", "trigger": f"Price is rejecting the sell FVG {_fmt_price(zone_low)}-{_fmt_price(zone_high)}; no candle close confirmation is required.", "execution": f"Sell near {_fmt_price(entry)}. SL goes above the FVG rejection wick at {_fmt_price(sl)}. TP targets a nearby common area around {_fmt_price(tp)}.", "side": "sell", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-sell-fvg-{int(_num(rejection.get('time'), _num(matching_fvg.get('startTime'))))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
+    if major_bias == "bullish":
+        scored = []
+        for candle in rejection_window:
+            high = _num(candle.get("high")); low = _num(candle.get("low")); open_ = _num(candle.get("open")); close = _num(candle.get("close"))
+            if high >= zone_low and low <= zone_high:
+                scored.append(((min(open_, close) - low) / max(atr, 0.01) + (1 if low <= zone_high else 0), candle, low, open_, close))
+        if scored:
+            _, rejection, rejection_low, rejection_open, rejection_close = max(scored, key=lambda item: item[0])
+            backing = entry > min(rejection_open, rejection_close)
+            if backing:
+                    sl = rejection_low - buffer
+                    risk = max(entry - sl, atr)
+                    zone_extension = min(zone_range * 0.25, atr * 1.2)
+                    common_area = max(zone_high + zone_extension, entry + atr * 0.9)
+                    tp = min(entry + risk * 1.1, max(zone_high + zone_range * 0.5, entry + atr * 1.1))
+                    if tp > entry and entry <= zone_high + max_chase:
+                        live_time = int(_num(last.get("time")))
+                        return {"active": True, "label": "Buy FVG Rejection", "trigger": f"Price is rejecting the buy FVG {_fmt_price(zone_low)}-{_fmt_price(zone_high)}; no candle close confirmation is required.", "execution": f"Buy near {_fmt_price(entry)}. SL goes below the FVG rejection wick at {_fmt_price(sl)}. TP targets a nearby common area around {_fmt_price(tp)}.", "side": "buy", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-buy-fvg-{int(_num(rejection.get('time'), _num(matching_fvg.get('startTime'))))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
+    return empty
+
+
+def evaluate_server_smc_once(symbol: str = SERVER_SMC_SYMBOL) -> dict[str, object]:
+    resolved_symbol, candles = fetch_candles(symbol, "M15", 500)
+    smc_candles = candles[-SERVER_SMC_CONTEXT_BARS:]
+    if len(smc_candles) < 24:
+        return {"status": "waiting", "detail": "Waiting for enough rolling M15 candles."}
+    smc = smc_structure(smc_candles)
+    plan = smc_plan(smc_candles, smc)
+    latest_fvg = smc.get("fairValueGaps", [])[-1] if smc.get("fairValueGaps") else None
+    fib = smc.get("fib") if isinstance(smc.get("fib"), dict) else None
+    fib_status = f"{str(fib.get('status', '')).upper()} - {fib.get('statusReason', '')}" if fib else "--"
+    append_ai_logic_audit(
+        build_ai_logic_event(
+            "server_smc_verdict",
+            "ready" if plan.get("active") else "hold",
+            resolved_symbol,
+            detail=str(plan.get("trigger") or "Server SMC heartbeat: no executable setup."),
+            model=SERVER_SMC_MODEL,
+            strategy_version="june10-reconstructed",
+            verdict=plan.get("side") or "hold",
+            setup_type=str(plan.get("label") or "No Active Setup"),
+            major_bias=str(smc.get("majorBias", "")),
+            minor_bias=str(smc.get("minorBias", "")),
+            market_phase=str(smc.get("state", "")),
+            fib_status=fib_status,
+            active_fvg=f"{str(latest_fvg.get('type')).upper()} {_fmt_price(latest_fvg.get('low'))}-{_fmt_price(latest_fvg.get('high'))}" if latest_fvg else "--",
+            signal_id=str(plan.get("signalId") or ""),
+            last_candle_time=int(_num(smc_candles[-1].get("time"))),
+        )
+    )
+    if not plan.get("active") or not plan.get("side"):
+        return {"status": "hold", "detail": "No executable server SMC setup."}
+    status_code, result = evaluate_autotrade_signal(
+        symbol=resolved_symbol,
+        side=str(plan["side"]),
+        lot=float(AUTOTRADE_STATE.get("lot", 0.01) or 0.01),
+        entry=plan.get("entry"),
+        sl=plan.get("sl"),
+        tp=plan.get("tp"),
+        signal_id=str(plan.get("signalId") or ""),
+        decision_key=str(plan.get("signalId") or ""),
+        action="server_smc_june10_reconstructed",
+        ai_trade={
+            "decision": str(plan["side"]),
+            "setup_type": str(plan["label"]),
+            "trigger_state": "server_m15_live_state",
+            "trigger_summary": str(plan["trigger"]),
+            "execution_summary": str(plan["execution"]),
+            "major_bias": str(smc.get("majorBias", "")),
+            "minor_bias": str(smc.get("minorBias", "")),
+            "market_phase": str(smc.get("state", "")),
+            "signal_key": str(plan.get("signalId") or ""),
+            "model": SERVER_SMC_MODEL,
+            "strategy_version": "june10-reconstructed",
+        },
+    )
+    return {"status": result.get("status", status_code), "detail": result.get("detail", ""), "signal_id": plan.get("signalId", "")}
+
+
+def server_smc_worker() -> None:
+    while True:
+        try:
+            maybe_run_server_smc()
+        except Exception as error:
+            append_ai_logic_audit(
+                build_ai_logic_event(
+                    "server_smc_worker",
+                    "error",
+                    SERVER_SMC_SYMBOL,
+                    detail=str(error),
+                    model=SERVER_SMC_MODEL,
+                    strategy_version="june10-reconstructed",
+                )
+            )
+        time.sleep(SERVER_SMC_INTERVAL_SECONDS)
+
+
+def maybe_run_server_smc() -> dict[str, object] | None:
+    now_ts = time.time()
+    if now_ts - float(SERVER_SMC_STATE.get("last_run_at", 0.0) or 0.0) < SERVER_SMC_INTERVAL_SECONDS:
+        return None
+    with AUTOTRADE_LOCK:
+        enabled = bool(AUTOTRADE_STATE.get("enabled"))
+        active = bool(AUTOTRADE_STATE.get("trade_active"))
+    if not enabled or active or get_cooldown_remaining_seconds() > 0:
+        return None
+    SERVER_SMC_STATE["last_run_at"] = now_ts
+    result = evaluate_server_smc_once()
+    SERVER_SMC_STATE["last_status"] = str(result.get("status", ""))
+    SERVER_SMC_STATE["last_detail"] = str(result.get("detail", ""))
+    return result
+
+
 
 def fetch_tick(symbol: str) -> dict[str, float | int | None]:
     with MT5_LOCK:
@@ -3220,7 +4096,14 @@ def has_open_trade(symbol: str, side: str | None = None) -> tuple[bool, str]:
     return False, ""
 
 
-def place_market_order(symbol: str, side: str, lot: float, sl: float | None, tp: float | None) -> dict[str, object]:
+def place_market_order(
+    symbol: str,
+    side: str,
+    lot: float,
+    sl: float | None,
+    tp: float | None,
+    sl_distance: float | None = None,
+) -> dict[str, object]:
     with MT5_LOCK:
         if not mt5.initialize():
             raise RuntimeError("Could not connect to MetaTrader 5. Make sure MT5 is open and logged in.")
@@ -3246,6 +4129,8 @@ def place_market_order(symbol: str, side: str, lot: float, sl: float | None, tp:
             volume = normalize_volume(symbol_info, lot)
             price = float(tick.ask if side == "buy" else tick.bid)
             order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
+            if sl is None and sl_distance is not None and sl_distance > 0:
+                sl = price - sl_distance if side == "buy" else price + sl_distance
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "magic": AUTOTRADE_MAGIC,
@@ -3314,7 +4199,11 @@ def place_market_order(symbol: str, side: str, lot: float, sl: float | None, tp:
 
 
 def get_cooldown_remaining_seconds() -> int:
-    return 0
+    last_trade_at = float(AUTOTRADE_STATE.get("last_trade_at") or 0.0)
+    if last_trade_at <= 0:
+        return 0
+    elapsed = max(0.0, time.time() - last_trade_at)
+    return max(0, int(math.ceil(AUTOTRADE_COOLDOWN_SECONDS - elapsed)))
 
 
 def maybe_sync_google_sheet_after_close() -> None:
@@ -3952,6 +4841,7 @@ def autonomous_ai_worker() -> None:
                 if bar_time is not None and bar_time != last_m15_bar_time:
                     last_m15_bar_time = bar_time
                     run_autonomous_ai_cycle()
+            maybe_run_server_smc()
         except Exception as error:
             append_ai_logic_audit(
                 build_ai_logic_event(
@@ -3990,7 +4880,14 @@ class AppHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/status":
-            self.respond_json(HTTPStatus.OK, {"status": "ok", "message": "MT5 bridge ready."})
+            self.respond_json(
+                HTTPStatus.OK,
+                {
+                    "status": "ok",
+                    "message": "MT5 bridge ready.",
+                    "calendar_provider": "tradingeconomics",
+                },
+            )
             return
 
         if parsed.path == "/api/ai/status":
@@ -4007,6 +4904,10 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/autotrade/status":
             self.handle_autotrade_status()
+            return
+
+        if parsed.path == "/api/news/calendar":
+            self.respond_json(HTTPStatus.OK, build_news_calendar_status())
             return
 
         if parsed.path == "/api/board":
@@ -4057,6 +4958,10 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/autotrade/evaluate":
             self.handle_autotrade_evaluate()
+            return
+
+        if parsed.path == "/api/autotrade/verdict":
+            self.handle_autotrade_verdict()
             return
 
         if parsed.path == "/api/dbb/webhook":
@@ -4271,7 +5176,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 "active_trade": AUTOTRADE_STATE["active_trade"],
                 "cooldown_remaining_seconds": get_cooldown_remaining_seconds(),
                 "cooldown_seconds": AUTOTRADE_COOLDOWN_SECONDS,
-                "news_calendar": build_manual_news_calendar_status(load_manual_news_calendar()),
+                "news_calendar": build_news_calendar_status(),
             }
         self.respond_json(HTTPStatus.OK, payload)
 
@@ -4289,16 +5194,74 @@ class AppHandler(SimpleHTTPRequestHandler):
             AUTOTRADE_STATE["enabled"] = enabled
             AUTOTRADE_STATE["lot"] = lot
             if news_calendar_payload is not None:
-                news_calendar_state = save_manual_news_calendar(news_calendar_payload)
-            else:
-                news_calendar_state = load_manual_news_calendar()
+                save_manual_news_calendar(news_calendar_payload)
             response = {
                 "enabled": AUTOTRADE_STATE["enabled"],
                 "lot": AUTOTRADE_STATE["lot"],
                 "one_trade_only": True,
-                "news_calendar": build_manual_news_calendar_status(news_calendar_state),
+                "news_calendar": build_news_calendar_status(),
             }
         self.respond_json(HTTPStatus.OK, response)
+
+    def handle_autotrade_verdict(self) -> None:
+        try:
+            payload = self.read_json_body()
+        except ValueError as error:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": str(error)})
+            return
+
+        symbol = normalize_symbol(str(payload.get("symbol", AUTONOMOUS_AI_SYMBOL) or AUTONOMOUS_AI_SYMBOL))
+        verdict = str(payload.get("verdict", "hold") or "hold").strip().lower()
+        setup_type = str(payload.get("setup_type", "No Active Setup") or "No Active Setup").strip()
+        major_bias = str(payload.get("major_bias", "") or "").strip()
+        minor_bias = str(payload.get("minor_bias", "") or "").strip()
+        market_phase = str(payload.get("market_phase", "") or "").strip()
+        fib_status = str(payload.get("fib_status", "") or "").strip()
+        trigger = str(payload.get("trigger", "") or "").strip()
+        signal_id = str(payload.get("signal_id", "") or "").strip()
+        last_candle_time = str(payload.get("last_candle_time", "") or "").strip()
+        verdict_key = "|".join([
+            symbol,
+            verdict,
+            setup_type,
+            major_bias,
+            minor_bias,
+            market_phase,
+            fib_status,
+            signal_id,
+            last_candle_time,
+        ])
+
+        now_ts = time.time()
+        with AUTOTRADE_LOCK:
+            previous_key = str(AUTOTRADE_STATE.get("last_verdict_key", "") or "")
+            previous_at = float(AUTOTRADE_STATE.get("last_verdict_at", 0.0) or 0.0)
+            if previous_key == verdict_key and now_ts - previous_at < 300:
+                self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": "Verdict unchanged."})
+                return
+            AUTOTRADE_STATE["last_verdict_key"] = verdict_key
+            AUTOTRADE_STATE["last_verdict_at"] = now_ts
+
+        append_ai_logic_audit(
+            build_ai_logic_event(
+                "trade_matrix_verdict",
+                "hold" if verdict == "hold" else "ready",
+                symbol,
+                detail=trigger or "Trade Matrix verdict heartbeat.",
+                model="local-smc-continuation",
+                verdict=verdict,
+                setup_type=setup_type,
+                major_bias=major_bias,
+                minor_bias=minor_bias,
+                market_phase=market_phase,
+                fib_status=fib_status,
+                ltf_tone=str(payload.get("ltf_tone", "") or "").strip(),
+                active_fvg=str(payload.get("active_fvg", "") or "").strip(),
+                signal_id=signal_id,
+                last_candle_time=last_candle_time,
+            )
+        )
+        self.respond_json(HTTPStatus.OK, {"status": "logged", "detail": "Verdict audit updated."})
 
     def handle_autotrade_evaluate(self) -> None:
         try:
@@ -4363,7 +5326,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
 
             try:
-                result = place_market_order(symbol, action, lot, sl=None, tp=None)
+                result = place_market_order(symbol, action, lot, sl=None, tp=None, sl_distance=DBB_FIXED_STOP_DISTANCE)
             except Exception as error:
                 self.respond_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": str(error)})
                 return
@@ -4434,6 +5397,8 @@ class AppHandler(SimpleHTTPRequestHandler):
 def main() -> None:
     autonomous_thread = threading.Thread(target=autonomous_ai_worker, name="autonomous-ai-worker", daemon=True)
     autonomous_thread.start()
+    server_smc_thread = threading.Thread(target=server_smc_worker, name="server-smc-worker", daemon=True)
+    server_smc_thread.start()
     sheet_sync_thread = threading.Thread(target=google_sheet_sync_worker, name="google-sheet-sync-worker", daemon=True)
     sheet_sync_thread.start()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
@@ -4442,7 +5407,8 @@ def main() -> None:
     if AUTONOMOUS_AI_ENABLED_BY_DEFAULT:
         print(f"Autonomous AI loop active for {AUTONOMOUS_AI_SYMBOL} every {AUTONOMOUS_AI_INTERVAL_SECONDS // 60} minutes.")
     else:
-        print("Autonomous AI loop disabled by default. Local DBB chart signals are the active trade source.")
+        print("Autonomous AI loop disabled by default.")
+    print(f"Server SMC trade loop active for {SERVER_SMC_SYMBOL} every {SERVER_SMC_INTERVAL_SECONDS} seconds.")
     print(f"Google Sheets sync worker active every {GOOGLE_SHEET_SYNC_INTERVAL_SECONDS} seconds.")
     print("Keep this terminal window open while using the site.")
     try:
