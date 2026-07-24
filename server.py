@@ -3023,6 +3023,22 @@ def evaluate_autotrade_signal(
     target_distance = abs(tp_value - entry_value)
     rr = (target_distance / risk_distance) if risk_distance > 0 else 0.0
 
+    if action == "server_smc_june10_reconstructed" and not smc_trade_distances_ok(entry_value, sl_value, tp_value):
+        detail = (
+            f"SMC risk guard rejected the plan: SL distance {risk_distance:.2f}, "
+            f"TP distance {target_distance:.2f}, RR {rr:.2f}."
+        )
+        log_autotrade(
+            "autotrade_validation",
+            "risk_guard",
+            detail,
+            entry=entry_value,
+            sl=sl_value,
+            tp=tp_value,
+            rr=round(rr, 4),
+        )
+        return HTTPStatus.OK.value, {"status": "risk_guard", "detail": detail}
+
     log_autotrade(
         "autotrade_validation",
         "passed",
@@ -3105,6 +3121,8 @@ def evaluate_autotrade_signal(
                         "analysis": str(ai_trade_payload.get("analysis", "")).strip(),
                         "timeframe_alignment": str(ai_trade_payload.get("timeframe_alignment", "")).strip(),
                         "market_phase": str(ai_trade_payload.get("market_phase", "")).strip(),
+                        "daily_bias": str(ai_trade_payload.get("daily_bias", "")).strip(),
+                        "daily_status": str(ai_trade_payload.get("daily_status", "")).strip(),
                         "bias": str(ai_trade_payload.get("bias", "")).strip(),
                         "location": str(ai_trade_payload.get("location", "")).strip(),
                         "setup_type": str(ai_trade_payload.get("setup_type", "")).strip(),
@@ -3509,10 +3527,10 @@ def _fmt_price(value: object) -> str:
     return "--" if not math.isfinite(parsed) else f"{parsed:.2f}"
 
 
-SMC_MAX_SL_INDEX = 20.0
+SMC_MAX_SL_INDEX = 15.0
 SMC_MAX_TP_INDEX = 20.0
 SMC_MIN_SL_INDEX = 3.0
-SMC_MIN_TP_INDEX = 3.0
+SMC_MIN_TP_INDEX = 4.0
 
 
 def smc_trade_distances_ok(entry: float, sl: float, tp: float) -> bool:
@@ -3738,6 +3756,85 @@ def smc_structure(candles: list[dict[str, float | int]]) -> dict[str, object]:
     return {"majorBias": major_bias, "minorBias": minor_bias, "state": state, "events": events[-100:], "fairValueGaps": smc_fvgs(candles), "fib": smc_fib(candles, major_bias)}
 
 
+def smc_new_day_insight(candles: list[dict[str, float | int]], smc: dict[str, object]) -> dict[str, object]:
+    neutral = {
+        "bias": "range",
+        "status": "unavailable",
+        "actionable": False,
+        "day": "",
+        "bars": 0,
+        "summary": "New-day context is unavailable.",
+    }
+    if not candles:
+        return neutral
+
+    current_day = smc_market_day_key(candles[-1].get("time"))
+    today = [candle for candle in candles if smc_market_day_key(candle.get("time")) == current_day]
+    previous = [candle for candle in candles if smc_market_day_key(candle.get("time")) < current_day]
+    if not today or not previous:
+        return {**neutral, "day": current_day, "bars": len(today), "status": "warming"}
+
+    previous_day = smc_market_day_key(previous[-1].get("time"))
+    previous_day_candles = [candle for candle in previous if smc_market_day_key(candle.get("time")) == previous_day]
+    current_open = _num(today[0].get("open"))
+    current_price = _num(today[-1].get("close"))
+    previous_high = max(_num(candle.get("high")) for candle in previous_day_candles)
+    previous_low = min(_num(candle.get("low")) for candle in previous_day_candles)
+    previous_close = _num(previous_day_candles[-1].get("close"))
+    previous_midpoint = (previous_high + previous_low) / 2
+
+    if current_price > current_open and current_price > previous_midpoint:
+        location_bias = "bullish"
+    elif current_price < current_open and current_price < previous_midpoint:
+        location_bias = "bearish"
+    else:
+        location_bias = "range"
+
+    events = smc.get("events") if isinstance(smc.get("events"), list) else []
+    today_structure = [
+        event for event in events
+        if event.get("label") in {"BOS", "CHoCH"} and smc_market_day_key(event.get("time")) == current_day
+    ]
+    structure_bias = str(today_structure[-1].get("direction", "range")) if today_structure else "range"
+    if structure_bias in {"bullish", "bearish"} and location_bias in {"range", structure_bias}:
+        daily_bias = structure_bias
+        status = "confirmed" if location_bias == structure_bias else "structure-led"
+    elif structure_bias == "range":
+        daily_bias = location_bias
+        status = "location-led" if location_bias != "range" else "mixed"
+    else:
+        daily_bias = "range"
+        status = "mixed"
+
+    ready = len(today) >= 4
+    actionable = ready and daily_bias in {"bullish", "bearish"}
+    if not ready:
+        status = "warming"
+    summary = (
+        f"New-day bias {daily_bias}; price {_fmt_price(current_price)} vs daily open {_fmt_price(current_open)} "
+        f"and prior midpoint {_fmt_price(previous_midpoint)}; today structure {structure_bias}; "
+        f"{len(today)} M15 bars."
+    )
+    return {
+        "bias": daily_bias,
+        "status": status,
+        "actionable": actionable,
+        "day": current_day,
+        "bars": len(today),
+        "currentOpen": current_open,
+        "currentPrice": current_price,
+        "previousHigh": previous_high,
+        "previousLow": previous_low,
+        "previousClose": previous_close,
+        "previousMidpoint": previous_midpoint,
+        "locationBias": location_bias,
+        "structureBias": structure_bias,
+        "sweptPreviousHigh": max(_num(candle.get("high")) for candle in today) > previous_high,
+        "sweptPreviousLow": min(_num(candle.get("low")) for candle in today) < previous_low,
+        "summary": summary,
+    }
+
+
 def smc_fib_angle(candles: list[dict[str, float | int]], fib: dict[str, object] | None) -> dict[str, object]:
     if not fib or fib.get("status") != "active":
         return {"label": "Reference", "doable": False}
@@ -3754,10 +3851,32 @@ def smc_fib_angle(candles: list[dict[str, float | int]], fib: dict[str, object] 
     return {"label": "Aggressive" if atr_per_bar > 0.75 else "Doable", "doable": True}
 
 
-def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> dict[str, object]:
+def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object], daily_insight: dict[str, object] | None = None) -> dict[str, object]:
     empty = {"active": False, "label": "No Active Setup", "trigger": "", "execution": "", "side": None, "entry": None, "sl": None, "tp": None, "signalId": ""}
-    major_bias = str(smc.get("majorBias", "range"))
-    if major_bias == "range" or not candles:
+    rolling_bias = str(smc.get("majorBias", "range"))
+    major_bias = rolling_bias
+    if not candles:
+        return empty
+    if daily_insight:
+        daily_bias = str(daily_insight.get("bias", "range"))
+        daily_status = str(daily_insight.get("status", ""))
+        if daily_status == "warming" and daily_bias in {"bullish", "bearish"} and rolling_bias in {"bullish", "bearish"} and daily_bias != rolling_bias:
+            return {
+                **empty,
+                "label": "New Day Warming Conflict",
+                "trigger": f"Paused during the first four M15 candles: rolling bias is {rolling_bias}, while provisional new-day bias is {daily_bias}.",
+                "execution": "Wait for provisional alignment or four M15 candles of new-day context.",
+            }
+        if bool(daily_insight.get("actionable")) and daily_bias in {"bullish", "bearish"} and daily_status == "confirmed":
+            major_bias = daily_bias
+        elif bool(daily_insight.get("actionable")) and daily_bias in {"bullish", "bearish"} and daily_bias != rolling_bias:
+            return {
+                **empty,
+                "label": "Daily Direction Conflict",
+                "trigger": f"Blocked: rolling M15 bias is {rolling_bias}, but {daily_insight.get('summary', 'new-day context is opposite.')}",
+                "execution": "Wait for fresh M15 structure to align with the new-day direction.",
+            }
+    if major_bias == "range":
         return empty
     atr = smc_atr(candles)
     if atr <= 0:
@@ -3765,7 +3884,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
     last = candles[-1]
     entry = _num(last.get("close"))
     buffer = max(atr * 0.35, 1.2)
-    fib = smc.get("fib") if isinstance(smc.get("fib"), dict) else None
+    fib = smc_fib(candles, major_bias) if major_bias != rolling_bias else smc.get("fib") if isinstance(smc.get("fib"), dict) else None
     fib_angle = smc_fib_angle(candles, fib)
     fib_active = bool(fib and fib.get("status") == "active" and fib_angle.get("doable") and len(candles) >= int(fib["endIndex"]) + 1)
 
@@ -3773,7 +3892,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
         pullback_high = max(_num(fib["startPrice"]), _num(fib["endPrice"]))
         pullback_low = min(_num(fib["startPrice"]), _num(fib["endPrice"]))
         pullback_range = max(pullback_high - pullback_low, atr)
-        rejection_start = max(0, int(fib["endIndex"]) - 1)
+        rejection_start = max(0, int(fib["endIndex"]) - 1, len(candles) - 18)
         rejection_window = [{**c, "index": rejection_start + i} for i, c in enumerate(candles[rejection_start:])]
         scored = []
         for candle in rejection_window:
@@ -3790,7 +3909,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
                     fib_targets = sorted([_num(level["price"]) for level in fib.get("levels", []) if level.get("key") in {"0.618", "0.5", "0.382"} and _num(level.get("price")) < entry - atr * 0.2], reverse=True)
                     common_target = pullback_low + pullback_range * 0.32
                     tp = max(entry - risk * 1.15, fib_targets[0] if fib_targets else common_target if common_target < entry else entry - atr * 1.15)
-                    if tp < entry:
+                    if tp < entry and smc_trade_distances_ok(entry, sl, tp):
                         live_time = int(_num(last.get("time")))
                         return {"active": True, "label": "Sell Rejection Continuation", "trigger": f"Price is fading from the rejection wick at {_fmt_price(rejection_high)} inside the bearish SMC state; no candle close confirmation is required.", "execution": f"Sell near {_fmt_price(entry)}. SL goes above the rejection wick at {_fmt_price(sl)}. TP is a common-area target around {_fmt_price(tp)}, not the deepest liquidity point.", "side": "sell", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-sell-reject-{int(_num(rejection.get('time'), _num(fib['endTime'])))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
 
@@ -3798,7 +3917,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
         pullback_high = max(_num(fib["startPrice"]), _num(fib["endPrice"]))
         pullback_low = min(_num(fib["startPrice"]), _num(fib["endPrice"]))
         pullback_range = max(pullback_high - pullback_low, atr)
-        rejection_start = max(0, int(fib["endIndex"]) - 1)
+        rejection_start = max(0, int(fib["endIndex"]) - 1, len(candles) - 18)
         rejection_window = [{**c, "index": rejection_start + i} for i, c in enumerate(candles[rejection_start:])]
         scored = []
         for candle in rejection_window:
@@ -3815,7 +3934,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
                     fib_targets = sorted([_num(level["price"]) for level in fib.get("levels", []) if level.get("key") in {"0.618", "0.5", "0.382"} and _num(level.get("price")) > entry + atr * 0.2])
                     common_target = pullback_high - pullback_range * 0.32
                     tp = min(entry + risk * 1.15, fib_targets[0] if fib_targets else common_target if common_target > entry else entry + atr * 1.15)
-                    if tp > entry:
+                    if tp > entry and smc_trade_distances_ok(entry, sl, tp):
                         live_time = int(_num(last.get("time")))
                         return {"active": True, "label": "Buy Rejection Continuation", "trigger": f"Price is backing up from the rejection wick at {_fmt_price(rejection_low)} inside the bullish SMC state; no candle close confirmation is required.", "execution": f"Buy near {_fmt_price(entry)}. SL goes below the rejection wick at {_fmt_price(sl)}. TP is a common-area target around {_fmt_price(tp)}, not the deepest liquidity point.", "side": "buy", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-buy-reject-{int(_num(rejection.get('time'), _num(fib['endTime'])))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
 
@@ -3883,7 +4002,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
         low = min(_num(gap.get("high")), _num(gap.get("low")))
         if any(_num(c.get("high")) >= low and _num(c.get("low")) <= high for c in recent_candles):
             touched_fvgs.append(gap)
-    matching_fvg = next((gap for gap in touched_fvgs if gap.get("type") == ("sell" if major_bias == "bearish" else "buy")), None) or (touched_fvgs[0] if touched_fvgs else None)
+    matching_fvg = next((gap for gap in touched_fvgs if gap.get("type") == ("sell" if major_bias == "bearish" else "buy")), None)
     if not matching_fvg:
         return empty
     zone_high = max(_num(matching_fvg.get("high")), _num(matching_fvg.get("low")))
@@ -3907,7 +4026,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
                     zone_extension = min(zone_range * 0.25, atr * 1.2)
                     common_area = min(zone_low - zone_extension, entry - atr * 0.9)
                     tp = max(entry - risk * 1.1, min(zone_low - zone_range * 0.5, entry - atr * 1.1))
-                    if tp < entry and entry >= zone_low - max_chase:
+                    if tp < entry and entry >= zone_low - max_chase and smc_trade_distances_ok(entry, sl, tp):
                         live_time = int(_num(last.get("time")))
                         return {"active": True, "label": "Sell FVG Rejection", "trigger": f"Price is rejecting the sell FVG {_fmt_price(zone_low)}-{_fmt_price(zone_high)}; no candle close confirmation is required.", "execution": f"Sell near {_fmt_price(entry)}. SL goes above the FVG rejection wick at {_fmt_price(sl)}. TP targets a nearby common area around {_fmt_price(tp)}.", "side": "sell", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-sell-fvg-{int(_num(rejection.get('time'), _num(matching_fvg.get('startTime'))))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
     if major_bias == "bullish":
@@ -3925,7 +4044,7 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object]) -> d
                     zone_extension = min(zone_range * 0.25, atr * 1.2)
                     common_area = max(zone_high + zone_extension, entry + atr * 0.9)
                     tp = min(entry + risk * 1.1, max(zone_high + zone_range * 0.5, entry + atr * 1.1))
-                    if tp > entry and entry <= zone_high + max_chase:
+                    if tp > entry and entry <= zone_high + max_chase and smc_trade_distances_ok(entry, sl, tp):
                         live_time = int(_num(last.get("time")))
                         return {"active": True, "label": "Buy FVG Rejection", "trigger": f"Price is rejecting the buy FVG {_fmt_price(zone_low)}-{_fmt_price(zone_high)}; no candle close confirmation is required.", "execution": f"Buy near {_fmt_price(entry)}. SL goes below the FVG rejection wick at {_fmt_price(sl)}. TP targets a nearby common area around {_fmt_price(tp)}.", "side": "buy", "entry": entry, "sl": sl, "tp": tp, "signalId": f"smc-buy-fvg-{int(_num(rejection.get('time'), _num(matching_fvg.get('startTime'))))}-{live_time}-{round(sl * 100)}-{round(tp * 100)}"}
     return empty
@@ -3937,7 +4056,9 @@ def evaluate_server_smc_once(symbol: str = SERVER_SMC_SYMBOL) -> dict[str, objec
     if len(smc_candles) < 24:
         return {"status": "waiting", "detail": "Waiting for enough rolling M15 candles."}
     smc = smc_structure(smc_candles)
-    plan = smc_plan(smc_candles, smc)
+    daily_insight = smc_new_day_insight(smc_candles, smc)
+    plan = smc_plan(smc_candles, smc, daily_insight)
+    effective_bias = str(daily_insight.get("bias")) if daily_insight.get("status") == "confirmed" else str(smc.get("majorBias", "range"))
     latest_fvg = smc.get("fairValueGaps", [])[-1] if smc.get("fairValueGaps") else None
     fib = smc.get("fib") if isinstance(smc.get("fib"), dict) else None
     fib_status = f"{str(fib.get('status', '')).upper()} - {fib.get('statusReason', '')}" if fib else "--"
@@ -3952,8 +4073,12 @@ def evaluate_server_smc_once(symbol: str = SERVER_SMC_SYMBOL) -> dict[str, objec
             verdict=plan.get("side") or "hold",
             setup_type=str(plan.get("label") or "No Active Setup"),
             major_bias=str(smc.get("majorBias", "")),
+            effective_bias=effective_bias,
             minor_bias=str(smc.get("minorBias", "")),
             market_phase=str(smc.get("state", "")),
+            daily_bias=str(daily_insight.get("bias", "range")),
+            daily_status=str(daily_insight.get("status", "")),
+            daily_summary=str(daily_insight.get("summary", "")),
             fib_status=fib_status,
             active_fvg=f"{str(latest_fvg.get('type')).upper()} {_fmt_price(latest_fvg.get('low'))}-{_fmt_price(latest_fvg.get('high'))}" if latest_fvg else "--",
             signal_id=str(plan.get("signalId") or ""),
@@ -3979,8 +4104,11 @@ def evaluate_server_smc_once(symbol: str = SERVER_SMC_SYMBOL) -> dict[str, objec
             "trigger_summary": str(plan["trigger"]),
             "execution_summary": str(plan["execution"]),
             "major_bias": str(smc.get("majorBias", "")),
+            "effective_bias": effective_bias,
             "minor_bias": str(smc.get("minorBias", "")),
             "market_phase": str(smc.get("state", "")),
+            "daily_bias": str(daily_insight.get("bias", "range")),
+            "daily_status": str(daily_insight.get("status", "")),
             "signal_key": str(plan.get("signalId") or ""),
             "model": SERVER_SMC_MODEL,
             "strategy_version": "june10-reconstructed",
