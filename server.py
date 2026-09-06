@@ -6,6 +6,10 @@ import os
 import threading
 import time
 import base64
+import hashlib
+import hmac
+import secrets
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -59,6 +63,14 @@ SHEET_SYNC_STATE_PATH = ROOT / "google_sheet_sync_state.json"
 SNAPSHOT_DIR = ROOT / "snapshots"
 LATEST_BOARD_IMAGE_PATH = SNAPSHOT_DIR / "latest-board.png"
 MANUAL_NEWS_CALENDAR_PATH = ROOT / "manual_news_calendar.json"
+AUTH_DB_PATH = ROOT / "quantum_auth.sqlite3"
+AUTH_SESSION_DAYS = 14
+AUTH_ALLOW_SIGNUP = os.environ.get("QUANTUM_ALLOW_SIGNUP", "false").strip().lower() in {"1", "true", "yes", "on"}
+AUTH_COOKIE_SECURE = os.environ.get("QUANTUM_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"}
+AUTH_INITIAL_ADMIN_EMAIL = (os.environ.get("QUANTUM_INITIAL_ADMIN_EMAIL") or "").strip().lower()
+AUTH_INITIAL_ADMIN_PASSWORD = os.environ.get("QUANTUM_INITIAL_ADMIN_PASSWORD") or ""
+TELEGRAM_BOT_TOKEN = os.environ.get("QUANTUM_TELEGRAM_BOT_TOKEN", "").strip()
+AUTH_LOCK = threading.RLock()
 TRADING_ECONOMICS_CALENDAR_CACHE_PATH = ROOT / "tradingeconomics_calendar_cache.json"
 DEFAULT_NEWS_BLOCK_BEFORE_MINUTES = 20
 DEFAULT_NEWS_BLOCK_AFTER_MINUTES = 20
@@ -120,6 +132,7 @@ AUTOTRADE_LOCK = threading.RLock()
 MT5_LOCK = threading.Lock()
 AI_LOGIC_AUDIT_LOCK = threading.RLock()
 AUTOTRADE_COOLDOWN_SECONDS = 0
+AUTOTRADE_BLOCKED_WEEKDAYS = {3: "Thursday", 4: "Friday"}
 SERVER_SMC_INTERVAL_SECONDS = 10
 SERVER_SMC_SYMBOL = os.environ.get("SERVER_SMC_SYMBOL", "XAUUSD").strip() or "XAUUSD"
 SERVER_SMC_MODEL = "server-smc-june10-reconstructed"
@@ -163,6 +176,219 @@ AVAILABLE_SETUP_TYPES = [
     "smc_sell",
 ]
 HISTORY_ALL_TIME_BASELINE = datetime(2026, 4, 1, tzinfo=MARKET_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def auth_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(str(AUTH_DB_PATH), timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def password_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return f"{salt.hex()}${digest.hex()}"
+
+
+def password_matches(password: str, encoded: str) -> bool:
+    try:
+        salt_hex, digest_hex = encoded.split("$", 1)
+        expected = password_hash(password, bytes.fromhex(salt_hex)).split("$", 1)[1]
+        return hmac.compare_digest(expected, digest_hex)
+    except (ValueError, AttributeError):
+        return False
+
+
+def initialize_auth_store() -> None:
+    with AUTH_LOCK, auth_connection() as connection:
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('admin', 'client')),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS copy_settings (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                active_lot REAL,
+                active_max_entries INTEGER,
+                pending_lot REAL,
+                pending_max_entries INTEGER,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS copy_accounts (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                terminal_path TEXT NOT NULL,
+                label TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS copy_positions (
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                master_ticket INTEGER NOT NULL,
+                client_ticket INTEGER NOT NULL,
+                side TEXT NOT NULL,
+                volume REAL NOT NULL,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT,
+                PRIMARY KEY (user_id, master_ticket, client_ticket)
+            );
+            CREATE TABLE IF NOT EXISTS copy_trade_ledger (
+                client_ticket INTEGER PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                master_ticket INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                volume REAL NOT NULL,
+                entry_price REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT,
+                net_profit REAL,
+                outcome TEXT CHECK(outcome IN ('win', 'loss', 'breakeven'))
+            );
+            CREATE TABLE IF NOT EXISTS copy_daily_summaries (
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                period_end_date TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, period_end_date)
+            );
+            CREATE TABLE IF NOT EXISTS notification_preferences (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                trade_alerts INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS telegram_links (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                chat_id TEXT UNIQUE,
+                pair_code TEXT,
+                pair_expires_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS broker_pairings (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                broker TEXT NOT NULL,
+                account_mode TEXT NOT NULL CHECK(account_mode IN ('demo', 'real')),
+                claimed_login TEXT NOT NULL,
+                pair_code TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                verified_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS copy_commands (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                command TEXT NOT NULL CHECK(command IN ('open', 'close')),
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued', 'processing', 'completed', 'failed')),
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                result TEXT
+            );
+        """)
+        copy_columns = {row["name"] for row in connection.execute("PRAGMA table_info(copy_accounts)").fetchall()}
+        if "account_mode" not in copy_columns:
+            connection.execute("ALTER TABLE copy_accounts ADD COLUMN account_mode TEXT NOT NULL DEFAULT 'demo' CHECK(account_mode IN ('demo', 'real'))")
+        if "mt5_login" not in copy_columns:
+            connection.execute("ALTER TABLE copy_accounts ADD COLUMN mt5_login TEXT")
+        pairing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(broker_pairings)").fetchall()}
+        if "mt5_server" not in pairing_columns:
+            connection.execute("ALTER TABLE broker_pairings ADD COLUMN mt5_server TEXT")
+        if AUTH_INITIAL_ADMIN_EMAIL and AUTH_INITIAL_ADMIN_PASSWORD:
+            exists = connection.execute("SELECT 1 FROM users WHERE email = ?", (AUTH_INITIAL_ADMIN_EMAIL,)).fetchone()
+            if not exists:
+                connection.execute(
+                    "INSERT INTO users (id, email, password_hash, role, created_at) VALUES (?, ?, ?, 'admin', ?)",
+                    (str(uuid.uuid4()), AUTH_INITIAL_ADMIN_EMAIL, password_hash(AUTH_INITIAL_ADMIN_PASSWORD), datetime.now(timezone.utc).isoformat()),
+                )
+
+
+def create_session(email: str, password: str) -> tuple[str, dict[str, str]] | None:
+    with AUTH_LOCK, auth_connection() as connection:
+        user = connection.execute("SELECT id, email, password_hash, role FROM users WHERE email = ?", (email.lower(),)).fetchone()
+        if not user or not password_matches(password, str(user["password_hash"])):
+            return None
+        raw_token = secrets.token_urlsafe(48)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        expires = datetime.now(timezone.utc) + timedelta(days=AUTH_SESSION_DAYS)
+        connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (datetime.now(timezone.utc).isoformat(),))
+        connection.execute("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)", (token_hash, user["id"], expires.isoformat()))
+        return raw_token, {"id": str(user["id"]), "email": str(user["email"]), "role": str(user["role"])}
+
+
+def copy_settings_for(user_id: str) -> dict[str, object]:
+    with AUTH_LOCK, auth_connection() as connection:
+        row = connection.execute("SELECT active_lot, active_max_entries, pending_lot, pending_max_entries, updated_at FROM copy_settings WHERE user_id = ?", (user_id,)).fetchone()
+    if not row:
+        return {"active": None, "pending": None, "armed": False}
+    active = {"lot": row["active_lot"], "max_entries": row["active_max_entries"]} if row["active_lot"] is not None and row["active_max_entries"] is not None else None
+    pending = {"lot": row["pending_lot"], "max_entries": row["pending_max_entries"]} if row["pending_lot"] is not None and row["pending_max_entries"] is not None else None
+    return {"active": active, "pending": pending, "armed": active is not None, "updated_at": row["updated_at"]}
+
+
+def master_copy_status() -> dict[str, object]:
+    with AUTOTRADE_LOCK:
+        autotrade_enabled = bool(AUTOTRADE_STATE.get("enabled", False))
+        trade_active = bool(AUTOTRADE_STATE.get("trade_active", False))
+    return {
+        "autotrade_enabled": autotrade_enabled,
+        "trade_active": trade_active,
+        "server_loop_status": str(SERVER_SMC_STATE.get("last_status", "starting") or "starting"),
+        "server_loop_detail": str(SERVER_SMC_STATE.get("last_detail", "") or ""),
+        "last_run_at": float(SERVER_SMC_STATE.get("last_run_at", 0) or 0),
+    }
+
+
+def queue_copy_open(master_result: dict[str, object]) -> int:
+    """Queue an already-filled master trade for enabled, armed family accounts.
+
+    A separate worker owns each MT5 terminal; this process never logs into a
+    family member's broker account or stores a broker password.
+    """
+    if master_result.get("status") != "placed":
+        return 0
+    payload = json.dumps({
+        "symbol": master_result.get("symbol"), "side": master_result.get("side"),
+        "sl": master_result.get("sl"), "tp": master_result.get("tp"),
+        "master_ticket": master_result.get("ticket"),
+    })
+    now = datetime.now(timezone.utc).isoformat()
+    with AUTH_LOCK, auth_connection() as connection:
+        rows = connection.execute("SELECT copy_accounts.user_id FROM copy_accounts JOIN copy_settings ON copy_settings.user_id = copy_accounts.user_id WHERE copy_accounts.enabled = 1 AND copy_settings.active_lot IS NOT NULL AND copy_settings.active_max_entries IS NOT NULL").fetchall()
+        for row in rows:
+            connection.execute("INSERT INTO copy_commands (id, user_id, command, payload, created_at) VALUES (?, ?, 'open', ?, ?)", (str(uuid.uuid4()), row["user_id"], payload, now))
+    return len(rows)
+
+
+def queue_copy_close(master_ticket: int) -> int:
+    if not master_ticket:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    with AUTH_LOCK, auth_connection() as connection:
+        rows = connection.execute("SELECT DISTINCT user_id FROM copy_positions WHERE master_ticket = ? AND closed_at IS NULL", (master_ticket,)).fetchall()
+        for row in rows:
+            connection.execute("INSERT INTO copy_commands (id, user_id, command, payload, created_at) VALUES (?, ?, 'close', ?, ?)", (str(uuid.uuid4()), row["user_id"], json.dumps({"master_ticket": master_ticket}), now))
+    return len(rows)
+
+
+def daily_copy_summary_worker() -> None:
+    malaysia_tz = timezone(timedelta(hours=8))
+    while True:
+        now = datetime.now(malaysia_tz)
+        if now.hour == 5 and now.minute < 2 and TELEGRAM_BOT_TOKEN:
+            period_end = now.replace(hour=5, minute=0, second=0, microsecond=0)
+            period_start = period_end - timedelta(days=1)
+            with AUTH_LOCK, auth_connection() as connection:
+                rows = connection.execute("SELECT accounts.user_id, links.chat_id, COUNT(ledger.client_ticket) AS trades, COALESCE(SUM(CASE WHEN ledger.outcome = 'win' THEN 1 ELSE 0 END), 0) AS wins, COALESCE(SUM(CASE WHEN ledger.outcome = 'loss' THEN 1 ELSE 0 END), 0) AS losses, COALESCE(SUM(ledger.net_profit), 0) AS pnl FROM copy_accounts AS accounts JOIN telegram_links AS links ON links.user_id = accounts.user_id LEFT JOIN copy_trade_ledger AS ledger ON ledger.user_id = accounts.user_id AND ledger.closed_at >= ? AND ledger.closed_at < ? LEFT JOIN copy_daily_summaries AS sent ON sent.user_id = accounts.user_id AND sent.period_end_date = ? WHERE links.chat_id IS NOT NULL AND sent.user_id IS NULL GROUP BY accounts.user_id, links.chat_id", (period_start.astimezone(timezone.utc).isoformat(), period_end.astimezone(timezone.utc).isoformat(), period_end.date().isoformat())).fetchall()
+                for row in rows:
+                    from telegram_worker import reply
+                    reply(TELEGRAM_BOT_TOKEN, str(row["chat_id"]), f"📊 DAILY QUANTUM SUMMARY\n\nPeriod: {period_start.strftime('%d %b')} 5:00 AM → {period_end.strftime('%d %b')} 5:00 AM MYT\nClosed trades: {row['trades']}\nWins / Losses: {row['wins']} / {row['losses']}\nRealized net P/L: {float(row['pnl']):+.2f}")
+                    connection.execute("INSERT INTO copy_daily_summaries (user_id, period_end_date, sent_at) VALUES (?, ?, ?)", (row["user_id"], period_end.date().isoformat(), datetime.now(timezone.utc).isoformat()))
+        time.sleep(30)
 
 
 def infer_broker_offset_seconds(symbol_hint: str = "XAUUSD.m") -> int:
@@ -2780,7 +3006,8 @@ def close_position(symbol: str, ticket: int, side: str, volume: float) -> dict[s
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 detail = getattr(result, "comment", "") or f"Retcode {result.retcode}"
                 return {"status": "rejected", "detail": f"MT5 rejected close: {detail}", "retcode": int(result.retcode)}
-            return {"status": "closed", "detail": "Position closed via DBB dynamic exit.", "ticket": ticket, "retcode": int(result.retcode)}
+            copied = queue_copy_close(ticket)
+            return {"status": "closed", "detail": "Position closed via DBB dynamic exit.", "ticket": ticket, "copy_recipients": copied, "retcode": int(result.retcode)}
         finally:
             mt5.shutdown()
 
@@ -3059,6 +3286,23 @@ def evaluate_autotrade_signal(
             detail = "Auto trade is disabled."
             log_autotrade("autotrade_dispatch", "disabled", detail)
             return HTTPStatus.OK.value, {"status": "disabled", "detail": detail}
+        broker_now = get_dashboard_now()
+        blocked_weekday = AUTOTRADE_BLOCKED_WEEKDAYS.get(broker_now.weekday())
+        if blocked_weekday:
+            detail = f"New auto-trade entries are blocked on {blocked_weekday}."
+            log_autotrade(
+                "autotrade_dispatch",
+                "weekday_block",
+                detail,
+                broker_time=broker_now.isoformat(),
+                blocked_weekday=blocked_weekday,
+            )
+            return HTTPStatus.OK.value, {
+                "status": "weekday_block",
+                "detail": detail,
+                "broker_time": broker_now.isoformat(),
+                "blocked_weekday": blocked_weekday,
+            }
         news_calendar_status = build_news_calendar_status()
         if bool(news_calendar_status.get("blocked")):
             active_event = news_calendar_status.get("active_event") if isinstance(news_calendar_status.get("active_event"), dict) else {}
@@ -3088,6 +3332,8 @@ def evaluate_autotrade_signal(
         AUTOTRADE_STATE["last_attempt_at"] = now
 
     result = place_market_order(normalized_symbol, normalized_side, lot_value, sl_value, tp_value)
+    if result.get("status") == "placed":
+        result["copy_recipients"] = queue_copy_open(result)
     log_autotrade(
         "autotrade_dispatch",
         str(result.get("status", "") or "unknown"),
@@ -5005,8 +5251,72 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.send_header("Expires", "0")
         super().end_headers()
 
+    def authenticated_user(self) -> dict[str, str] | None:
+        cookie_header = self.headers.get("Cookie", "")
+        token = ""
+        for item in cookie_header.split(";"):
+            name, _, value = item.strip().partition("=")
+            if name == "quantum_session":
+                token = value
+                break
+        if not token:
+            return None
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with AUTH_LOCK, auth_connection() as connection:
+            row = connection.execute(
+                "SELECT users.id, users.email, users.role FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ?",
+                (token_hash, datetime.now(timezone.utc).isoformat()),
+            ).fetchone()
+        return {"id": str(row["id"]), "email": str(row["email"]), "role": str(row["role"])} if row else None
+
+    def require_user(self, admin_only: bool = False) -> dict[str, str] | None:
+        user = self.authenticated_user()
+        if not user:
+            self.respond_json(HTTPStatus.UNAUTHORIZED, {"detail": "Sign in is required."})
+            return None
+        if admin_only and user["role"] != "admin":
+            self.respond_json(HTTPStatus.FORBIDDEN, {"detail": "Administrator access is required."})
+            return None
+        return user
+
+    def send_session_cookie(self, token: str) -> None:
+        secure = "; Secure" if AUTH_COOKIE_SECURE else ""
+        self.send_header("Set-Cookie", f"quantum_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={AUTH_SESSION_DAYS * 86400}{secure}")
+
+    def clear_session_cookie(self) -> None:
+        secure = "; Secure" if AUTH_COOKIE_SECURE else ""
+        self.send_header("Set-Cookie", f"quantum_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/session":
+            user = self.authenticated_user()
+            self.respond_json(HTTPStatus.OK, {"user": user, "signup_enabled": AUTH_ALLOW_SIGNUP})
+            return
+        if parsed.path == "/api/copy/settings":
+            user = self.require_user()
+            if user:
+                self.respond_json(HTTPStatus.OK, copy_settings_for(user["id"]))
+            return
+        if parsed.path == "/api/telegram/pair":
+            user = self.require_user()
+            if user:
+                self.handle_telegram_pair_code(user)
+            return
+        if parsed.path == "/api/broker/pair":
+            user = self.require_user()
+            if user:
+                self.handle_broker_pair_status(user)
+            return
+        if parsed.path == "/api/admin/members":
+            user = self.require_user(admin_only=True)
+            if user:
+                self.handle_admin_members()
+            return
+        # Current MT5 data belongs to the one locally-connected broker terminal.
+        # Keep it administrator-only until per-client broker connections exist.
+        if parsed.path.startswith("/api/") and not self.require_user(admin_only=True):
+            return
         if parsed.path == "/api/status":
             self.respond_json(
                 HTTPStatus.OK,
@@ -5072,6 +5382,43 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/login":
+            self.handle_login()
+            return
+        if parsed.path == "/api/auth/logout":
+            self.handle_logout()
+            return
+        if parsed.path == "/api/auth/signup":
+            self.handle_signup()
+            return
+        if parsed.path == "/api/copy/settings/change":
+            user = self.require_user()
+            if user:
+                self.handle_copy_settings_change(user)
+            return
+        if parsed.path == "/api/broker/pair":
+            user = self.require_user()
+            if user:
+                self.handle_broker_pair_start(user)
+            return
+        if parsed.path == "/api/copy/settings/confirm":
+            user = self.require_user()
+            if user:
+                self.handle_copy_settings_confirm(user)
+            return
+        if parsed.path == "/api/copy/accounts/provision":
+            user = self.require_user(admin_only=True)
+            if user:
+                self.handle_copy_account_provision()
+            return
+        if parsed.path == "/api/auth/users":
+            if self.require_user(admin_only=True):
+                self.handle_create_user()
+            return
+        # The webhook is intended for TradingView and cannot use a browser session.
+        # It stays private to the local bridge; do not expose it through a public proxy.
+        if parsed.path != "/api/dbb/webhook" and not self.require_user(admin_only=True):
+            return
         if parsed.path == "/api/ai/snapshot":
             self.handle_ai_snapshot()
             return
@@ -5097,6 +5444,152 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
 
         self.respond_json(HTTPStatus.NOT_FOUND, {"detail": "Unknown endpoint."})
+
+    def handle_login(self) -> None:
+        try:
+            payload = self.read_json_body()
+            email = str(payload.get("email", "")).strip().lower()
+            password = str(payload.get("password", ""))
+        except ValueError as error:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": str(error)})
+            return
+        if not email or not password:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Email and password are required."})
+            return
+        result = create_session(email, password)
+        if not result:
+            self.respond_json(HTTPStatus.UNAUTHORIZED, {"detail": "Invalid email or password."})
+            return
+        token, user = result
+        self.respond_json(HTTPStatus.OK, {"user": user}, session_token=token)
+
+    def handle_logout(self) -> None:
+        user_token = ""
+        for item in self.headers.get("Cookie", "").split(";"):
+            name, _, value = item.strip().partition("=")
+            if name == "quantum_session":
+                user_token = value
+                break
+        if user_token:
+            with AUTH_LOCK, auth_connection() as connection:
+                connection.execute("DELETE FROM sessions WHERE token_hash = ?", (hashlib.sha256(user_token.encode("utf-8")).hexdigest(),))
+        self.respond_json(HTTPStatus.OK, {"status": "signed_out"}, clear_session=True)
+
+    def handle_signup(self) -> None:
+        if not AUTH_ALLOW_SIGNUP:
+            self.respond_json(HTTPStatus.FORBIDDEN, {"detail": "Self-service sign-up is disabled. Ask an administrator for an account."})
+            return
+        self.create_user_from_request("client")
+
+    def handle_create_user(self) -> None:
+        self.create_user_from_request("client")
+
+    def create_user_from_request(self, role: str) -> None:
+        try:
+            payload = self.read_json_body()
+            email = str(payload.get("email", "")).strip().lower()
+            password = str(payload.get("password", ""))
+        except ValueError as error:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": str(error)})
+            return
+        if "@" not in email or len(password) < 12:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Use a valid email and a password of at least 12 characters."})
+            return
+        try:
+            with AUTH_LOCK, auth_connection() as connection:
+                user_id = str(uuid.uuid4())
+                connection.execute("INSERT INTO users (id, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)", (user_id, email, password_hash(password), role, datetime.now(timezone.utc).isoformat()))
+            self.respond_json(HTTPStatus.CREATED, {"user": {"id": user_id, "email": email, "role": role}})
+        except sqlite3.IntegrityError:
+            self.respond_json(HTTPStatus.CONFLICT, {"detail": "An account with that email already exists."})
+
+    def handle_copy_settings_change(self, user: dict[str, str]) -> None:
+        try:
+            payload = self.read_json_body()
+            lot = round(float(payload.get("lot")), 2)
+            max_entries = int(payload.get("max_entries"))
+        except (ValueError, TypeError):
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Lot size and maximum entries are required."})
+            return
+        if not 0.01 <= lot <= 100 or not 1 <= max_entries <= 10:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Lot must be 0.01–100 and entries must be 1–10."})
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with AUTH_LOCK, auth_connection() as connection:
+            connection.execute("INSERT INTO copy_settings (user_id, pending_lot, pending_max_entries, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET pending_lot = excluded.pending_lot, pending_max_entries = excluded.pending_max_entries, updated_at = excluded.updated_at", (user["id"], lot, max_entries, now))
+        self.respond_json(HTTPStatus.OK, copy_settings_for(user["id"]))
+
+    def handle_copy_settings_confirm(self, user: dict[str, str]) -> None:
+        with AUTH_LOCK, auth_connection() as connection:
+            pending = connection.execute("SELECT pending_lot, pending_max_entries FROM copy_settings WHERE user_id = ?", (user["id"],)).fetchone()
+            if not pending or pending["pending_lot"] is None or pending["pending_max_entries"] is None:
+                self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Choose lot size and entries before confirming."})
+                return
+            connection.execute("UPDATE copy_settings SET active_lot = pending_lot, active_max_entries = pending_max_entries, pending_lot = NULL, pending_max_entries = NULL, updated_at = ? WHERE user_id = ?", (datetime.now(timezone.utc).isoformat(), user["id"]))
+        self.respond_json(HTTPStatus.OK, copy_settings_for(user["id"]))
+
+    def handle_copy_account_provision(self) -> None:
+        try:
+            payload = self.read_json_body()
+            email = str(payload.get("email", "")).strip().lower()
+            terminal_path = str(payload.get("terminal_path", "")).strip()
+            label = str(payload.get("label", email)).strip() or email
+            account_mode = str(payload.get("account_mode", "demo")).strip().lower()
+            mt5_login = str(payload.get("mt5_login", "")).strip()
+            # The initial provisioning release is intentionally paper-safe.
+            # Enabling requires the completed close-sync/risk-worker release.
+            enabled = False
+        except ValueError as error:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": str(error)})
+            return
+        if not email or not terminal_path or account_mode not in {"demo", "real"}:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Client email and the dedicated MT5 terminal path are required."})
+            return
+        with AUTH_LOCK, auth_connection() as connection:
+            client = connection.execute("SELECT id FROM users WHERE email = ? AND role = 'client'", (email,)).fetchone()
+            if not client:
+                self.respond_json(HTTPStatus.NOT_FOUND, {"detail": "No client account exists for that email."})
+                return
+            connection.execute("INSERT INTO copy_accounts (user_id, terminal_path, label, enabled, created_at, account_mode, mt5_login) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET terminal_path = excluded.terminal_path, label = excluded.label, enabled = excluded.enabled, account_mode = excluded.account_mode, mt5_login = excluded.mt5_login", (client["id"], terminal_path, label, int(enabled), datetime.now(timezone.utc).isoformat(), account_mode, mt5_login))
+        self.respond_json(HTTPStatus.OK, {"status": "provisioned", "email": email, "account_mode": account_mode, "enabled": enabled, "worker": f"python copy_worker.py --email {email}"})
+
+    def handle_telegram_pair_code(self, user: dict[str, str]) -> None:
+        if not TELEGRAM_BOT_TOKEN:
+            self.respond_json(HTTPStatus.SERVICE_UNAVAILABLE, {"detail": "Telegram is not configured on this server."})
+            return
+        code = secrets.token_urlsafe(6).upper()
+        expires = datetime.now(timezone.utc) + timedelta(minutes=10)
+        with AUTH_LOCK, auth_connection() as connection:
+            connection.execute("INSERT INTO telegram_links (user_id, pair_code, pair_expires_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET pair_code = excluded.pair_code, pair_expires_at = excluded.pair_expires_at", (user["id"], code, expires.isoformat()))
+        self.respond_json(HTTPStatus.OK, {"code": code, "expires_at": expires.isoformat(), "instruction": f"Send /link {code} to your Quantum Telegram bot."})
+
+    def handle_broker_pair_status(self, user: dict[str, str]) -> None:
+        with AUTH_LOCK, auth_connection() as connection:
+            row = connection.execute("SELECT broker, account_mode, claimed_login, expires_at, verified_at FROM broker_pairings WHERE user_id = ?", (user["id"],)).fetchone()
+        self.respond_json(HTTPStatus.OK, {"pairing": dict(row) if row else None})
+
+    def handle_broker_pair_start(self, user: dict[str, str]) -> None:
+        try:
+            payload = self.read_json_body()
+            account_mode = str(payload.get("account_mode", "")).strip().lower()
+            login = str(payload.get("login", "")).strip()
+        except ValueError as error:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": str(error)})
+            return
+        if account_mode not in {"demo", "real"} or not login.isdigit() or len(login) < 4:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Choose Demo or Real and enter a valid MT5 account number."})
+            return
+        code = secrets.token_urlsafe(8).upper()
+        expires = datetime.now(timezone.utc) + timedelta(minutes=10)
+        with AUTH_LOCK, auth_connection() as connection:
+            connection.execute("INSERT INTO broker_pairings (user_id, broker, account_mode, claimed_login, pair_code, expires_at) VALUES (?, 'justmarkets', ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET broker = 'justmarkets', account_mode = excluded.account_mode, claimed_login = excluded.claimed_login, pair_code = excluded.pair_code, expires_at = excluded.expires_at, verified_at = NULL", (user["id"], account_mode, login, code, expires.isoformat()))
+        self.respond_json(HTTPStatus.OK, {"broker": "JustMarkets", "account_mode": account_mode, "login": login, "code": code, "expires_at": expires.isoformat(), "status": "awaiting_terminal_verification"})
+
+    def handle_admin_members(self) -> None:
+        with AUTH_LOCK, auth_connection() as connection:
+            rows = connection.execute("SELECT users.email, users.created_at, copy_accounts.account_mode, copy_accounts.mt5_login, copy_accounts.enabled, broker_pairings.verified_at, telegram_links.chat_id, copy_settings.active_lot, copy_settings.active_max_entries FROM users LEFT JOIN copy_accounts ON copy_accounts.user_id = users.id LEFT JOIN broker_pairings ON broker_pairings.user_id = users.id LEFT JOIN telegram_links ON telegram_links.user_id = users.id LEFT JOIN copy_settings ON copy_settings.user_id = users.id WHERE users.role = 'client' ORDER BY users.created_at DESC").fetchall()
+        members = [{"email": str(row["email"]), "created_at": str(row["created_at"]), "broker": "JustMarkets" if row["mt5_login"] else None, "account_mode": row["account_mode"], "account_suffix": f"••••{str(row['mt5_login'])[-4:]}" if row["mt5_login"] else None, "broker_verified": bool(row["verified_at"]), "telegram_paired": bool(row["chat_id"]), "copy_enabled": bool(row["enabled"]), "lot": row["active_lot"], "max_entries": row["active_max_entries"]} for row in rows]
+        self.respond_json(HTTPStatus.OK, {"members": members})
 
     def handle_board(self, query: str) -> None:
         params = parse_qs(query)
@@ -5455,6 +5948,8 @@ class AppHandler(SimpleHTTPRequestHandler):
 
             try:
                 result = place_market_order(symbol, action, lot, sl=None, tp=None, sl_distance=DBB_FIXED_STOP_DISTANCE)
+                if result.get("status") == "placed":
+                    result["copy_recipients"] = queue_copy_open(result)
             except Exception as error:
                 self.respond_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": str(error)})
                 return
@@ -5508,12 +6003,16 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": f"Unknown action: '{action}'. Expected buy, sell, close_buy, or close_sell."})
 
-    def respond_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
+    def respond_json(self, status: HTTPStatus, payload: dict[str, object], session_token: str | None = None, clear_session: bool = False) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status.value)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if session_token:
+            self.send_session_cookie(session_token)
+        if clear_session:
+            self.clear_session_cookie()
         try:
             self.end_headers()
             self.wfile.write(body)
@@ -5523,6 +6022,15 @@ class AppHandler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    initialize_auth_store()
+    if TELEGRAM_BOT_TOKEN:
+        from telegram_worker import telegram_worker
+        threading.Thread(target=telegram_worker, args=(TELEGRAM_BOT_TOKEN,), name="telegram-worker", daemon=True).start()
+        threading.Thread(target=daily_copy_summary_worker, name="daily-copy-summary-worker", daemon=True).start()
+    with AUTH_LOCK, auth_connection() as connection:
+        has_admin = connection.execute("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1").fetchone() is not None
+    if not has_admin:
+        print("WARNING: no admin account was bootstrapped. Set QUANTUM_INITIAL_ADMIN_EMAIL and QUANTUM_INITIAL_ADMIN_PASSWORD before first launch.")
     autonomous_thread = threading.Thread(target=autonomous_ai_worker, name="autonomous-ai-worker", daemon=True)
     autonomous_thread.start()
     server_smc_thread = threading.Thread(target=server_smc_worker, name="server-smc-worker", daemon=True)
@@ -5532,6 +6040,7 @@ def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
     frontend_label = "Neural Alpha dist" if FRONTEND_ROOT == NEURAL_APP_DIST else "Quantum workspace"
     print(f"Serving {frontend_label} at http://{HOST}:{PORT}")
+    print("Telegram family-control worker active." if TELEGRAM_BOT_TOKEN else "Telegram family-control worker disabled (QUANTUM_TELEGRAM_BOT_TOKEN is not set).")
     if AUTONOMOUS_AI_ENABLED_BY_DEFAULT:
         print(f"Autonomous AI loop active for {AUTONOMOUS_AI_SYMBOL} every {AUTONOMOUS_AI_INTERVAL_SECONDS // 60} minutes.")
     else:

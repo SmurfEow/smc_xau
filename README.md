@@ -112,6 +112,15 @@ Important: the local DBB chart/webhook auto-trade path requires the dashboard ta
 
 ## Run
 
+Before the first start, create the administrator account in the same PowerShell window. Use a unique, long password; it is stored only as a slow password hash in `quantum_auth.sqlite3`.
+
+```powershell
+$env:QUANTUM_INITIAL_ADMIN_EMAIL = "you@example.com"
+$env:QUANTUM_INITIAL_ADMIN_PASSWORD = "replace-this-with-a-unique-long-password"
+# Required when hosting behind HTTPS; leave false for localhost development.
+$env:QUANTUM_COOKIE_SECURE = "true"
+```
+
 ```powershell
 python server.py
 ```
@@ -127,6 +136,14 @@ Then open:
 ```text
 http://localhost:8090
 ```
+
+## Accounts and access
+
+Every dashboard/API request now requires a signed-in account. The first account configured with `QUANTUM_INITIAL_ADMIN_EMAIL` is an administrator; administrators can issue client accounts through `POST /api/auth/users` with an email and a password of at least 12 characters. Client accounts can view the terminal, but only an administrator can call the trade-changing API endpoints.
+
+Self-service registration is off by default. Set `QUANTUM_ALLOW_SIGNUP=true` only if you deliberately want new visitors to be able to register.
+
+This release protects access to the existing, single local MT5 terminal. It deliberately does **not** pretend that one shared MT5 login is separate client brokerage accounts: isolated client portfolios require one MT5/broker connection and user-scoped trade/history storage per client, which should be the next deployment phase before enabling client trading.
 
 ---
 
