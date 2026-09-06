@@ -212,7 +212,7 @@ $env:GOOGLE_SHEET_ID='your-google-sheet-id'
 python google_sheet_sync.py --push
 ```
 
-Auto-sync after closed trades is active when credentials are set and `server.py` is running.
+Google Sheets sync is disabled in a fresh clone. Auto-sync after closed master trades activates only when both local variables above are set and `server.py` is running. Do not put a service-account JSON file, sheet ID, Telegram token, broker password, or MT5 profile into Git.
 
 ---
 
