@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -133,6 +134,11 @@ MT5_LOCK = threading.Lock()
 AI_LOGIC_AUDIT_LOCK = threading.RLock()
 AUTOTRADE_COOLDOWN_SECONDS = 0
 AUTOTRADE_BLOCKED_WEEKDAYS = {3: "Thursday", 4: "Friday"}
+# Family-session safety rule: do not create new master entries during the
+# global Asia session (00:00-06:59 UTC). Its displayed broker-time window
+# automatically shifts whenever the broker's UTC offset changes.
+AUTOTRADE_ASIA_BLOCK_START_UTC_HOUR = 0
+AUTOTRADE_ASIA_BLOCK_END_UTC_HOUR = 7
 SERVER_SMC_INTERVAL_SECONDS = 10
 SERVER_SMC_SYMBOL = os.environ.get("SERVER_SMC_SYMBOL", "XAUUSD").strip() or "XAUUSD"
 SERVER_SMC_MODEL = "server-smc-june10-reconstructed"
@@ -264,6 +270,13 @@ def initialize_auth_store() -> None:
                 user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 trade_alerts INTEGER NOT NULL DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS telegram_links (
                 user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 chat_id TEXT UNIQUE,
@@ -376,17 +389,16 @@ def queue_copy_close(master_ticket: int) -> int:
 
 
 def daily_copy_summary_worker() -> None:
-    malaysia_tz = timezone(timedelta(hours=8))
     while True:
-        now = datetime.now(malaysia_tz)
-        if now.hour == 5 and now.minute < 2 and TELEGRAM_BOT_TOKEN:
-            period_end = now.replace(hour=5, minute=0, second=0, microsecond=0)
+        now = get_broker_now()
+        if now.hour == 0 and now.minute < 2 and TELEGRAM_BOT_TOKEN:
+            period_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
             period_start = period_end - timedelta(days=1)
             with AUTH_LOCK, auth_connection() as connection:
                 rows = connection.execute("SELECT accounts.user_id, links.chat_id, COUNT(ledger.client_ticket) AS trades, COALESCE(SUM(CASE WHEN ledger.outcome = 'win' THEN 1 ELSE 0 END), 0) AS wins, COALESCE(SUM(CASE WHEN ledger.outcome = 'loss' THEN 1 ELSE 0 END), 0) AS losses, COALESCE(SUM(ledger.net_profit), 0) AS pnl FROM copy_accounts AS accounts JOIN telegram_links AS links ON links.user_id = accounts.user_id LEFT JOIN copy_trade_ledger AS ledger ON ledger.user_id = accounts.user_id AND ledger.closed_at >= ? AND ledger.closed_at < ? LEFT JOIN copy_daily_summaries AS sent ON sent.user_id = accounts.user_id AND sent.period_end_date = ? WHERE links.chat_id IS NOT NULL AND sent.user_id IS NULL GROUP BY accounts.user_id, links.chat_id", (period_start.astimezone(timezone.utc).isoformat(), period_end.astimezone(timezone.utc).isoformat(), period_end.date().isoformat())).fetchall()
                 for row in rows:
                     from telegram_worker import reply
-                    reply(TELEGRAM_BOT_TOKEN, str(row["chat_id"]), f"📊 DAILY QUANTUM SUMMARY\n\nPeriod: {period_start.strftime('%d %b')} 5:00 AM → {period_end.strftime('%d %b')} 5:00 AM MYT\nClosed trades: {row['trades']}\nWins / Losses: {row['wins']} / {row['losses']}\nRealized net P/L: {float(row['pnl']):+.2f}")
+                    reply(TELEGRAM_BOT_TOKEN, str(row["chat_id"]), f"📊 DAILY QUANTUM SUMMARY\n\nPeriod: {period_start.strftime('%d %b')} 00:00 → {period_end.strftime('%d %b')} 00:00 Broker Time\nClosed trades: {row['trades']}\nWins / Losses: {row['wins']} / {row['losses']}\nRealized net P/L: {float(row['pnl']):+.2f}")
                     connection.execute("INSERT INTO copy_daily_summaries (user_id, period_end_date, sent_at) VALUES (?, ?, ?)", (row["user_id"], period_end.date().isoformat(), datetime.now(timezone.utc).isoformat()))
         time.sleep(30)
 
@@ -413,24 +425,91 @@ def infer_broker_offset_seconds(symbol_hint: str = "XAUUSD.m") -> int:
     return BROKER_OFFSET_FALLBACK_SECONDS
 
 
-def get_dashboard_now() -> datetime:
+def get_broker_now() -> datetime:
     offset_seconds = infer_broker_offset_seconds()
-    return datetime.now(MARKET_TIMEZONE) + timedelta(seconds=offset_seconds)
+    broker_timezone = timezone(timedelta(seconds=offset_seconds))
+    return datetime.now(timezone.utc).astimezone(broker_timezone)
+
+
+def get_dashboard_now() -> datetime:
+    """Compatibility name for the single live broker clock."""
+    return get_broker_now()
 
 
 def to_dashboard_time(unix_seconds: int) -> datetime:
-    return datetime.fromtimestamp(int(unix_seconds or 0), MARKET_TIMEZONE)
+    broker_timezone = get_broker_now().tzinfo or timezone.utc
+    return datetime.fromtimestamp(int(unix_seconds or 0), timezone.utc).astimezone(broker_timezone)
 
 
 def classify_trading_session(dt: datetime | None) -> str:
     if dt is None:
         return "Unknown"
-    hour = int(dt.hour)
-    if 0 <= hour < 8:
+    # Session labels follow the actual global market windows; timestamps shown
+    # to users remain broker time through to_dashboard_time().
+    hour = int(dt.astimezone(timezone.utc).hour)
+    if 0 <= hour < 7:
         return "Asia"
-    if 8 <= hour < 16:
+    if 7 <= hour < 12:
         return "London"
     return "New York"
+
+
+def asia_entry_window_status(now: datetime | None = None) -> dict[str, object]:
+    """Return the Asia guard using the live broker clock as the display clock."""
+    utc_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    broker_now = get_broker_now() if now is None else utc_now.astimezone(get_broker_now().tzinfo or timezone.utc)
+    blocked = AUTOTRADE_ASIA_BLOCK_START_UTC_HOUR <= utc_now.hour < AUTOTRADE_ASIA_BLOCK_END_UTC_HOUR
+    broker_start = (utc_now.replace(hour=AUTOTRADE_ASIA_BLOCK_START_UTC_HOUR, minute=0, second=0, microsecond=0)).astimezone(broker_now.tzinfo)
+    broker_end = (utc_now.replace(hour=AUTOTRADE_ASIA_BLOCK_END_UTC_HOUR, minute=0, second=0, microsecond=0)).astimezone(broker_now.tzinfo)
+    return {
+        "blocked": blocked,
+        "broker_time": broker_now.isoformat(),
+        "blocked_window": f"{broker_start.strftime('%H:%M')}–{broker_end.strftime('%H:%M')} Broker Time",
+        "detail": (
+            f"New auto-trade entries are blocked during Asia ({broker_start.strftime('%H:%M')}–{broker_end.strftime('%H:%M')} Broker Time)."
+            if blocked else
+            "Entry window is open (Asia session guard is inactive)."
+        ),
+    }
+
+
+def london_us_transition_window_status(now: datetime | None = None) -> dict[str, object]:
+    """Block one hour either side of the U.S. session handoff.
+
+    New York's 08:00 local session start is used instead of a hard-coded
+    broker hour, so both U.S. and broker daylight-saving changes are handled.
+    """
+    utc_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    new_york_now = utc_now.astimezone(ZoneInfo("America/New_York"))
+    handoff = new_york_now.replace(hour=8, minute=0, second=0, microsecond=0)
+    transition_start = handoff - timedelta(hours=1)
+    transition_end = handoff + timedelta(hours=1)
+    broker_timezone = get_broker_now().tzinfo or timezone.utc
+    broker_now = utc_now.astimezone(broker_timezone)
+    broker_start = transition_start.astimezone(broker_timezone)
+    broker_end = transition_end.astimezone(broker_timezone)
+    blocked = transition_start <= new_york_now < transition_end
+    return {
+        "blocked": blocked,
+        "broker_time": broker_now.isoformat(),
+        "blocked_window": f"{broker_start.strftime('%H:%M')}â€“{broker_end.strftime('%H:%M')} Broker Time",
+        "detail": (
+            f"New auto-trade entries are blocked during the London-to-U.S. transition ({broker_start.strftime('%H:%M')}â€“{broker_end.strftime('%H:%M')} Broker Time)."
+            if blocked else
+            "Entry window is open (London-to-U.S. transition guard is inactive)."
+        ),
+    }
+
+
+def entry_time_guard_status(now: datetime | None = None) -> dict[str, object]:
+    """Apply every time-of-day entry safeguard in a single place."""
+    asia = asia_entry_window_status(now)
+    if bool(asia["blocked"]):
+        return {**asia, "guard": "asia"}
+    transition = london_us_transition_window_status(now)
+    if bool(transition["blocked"]):
+        return {**transition, "guard": "london_us_transition"}
+    return {**transition, "guard": None}
 
 
 def parse_date_input(value: str | None) -> datetime | None:
@@ -3286,6 +3365,11 @@ def evaluate_autotrade_signal(
             detail = "Auto trade is disabled."
             log_autotrade("autotrade_dispatch", "disabled", detail)
             return HTTPStatus.OK.value, {"status": "disabled", "detail": detail}
+        session_guard = entry_time_guard_status()
+        if bool(session_guard["blocked"]):
+            detail = str(session_guard["detail"])
+            log_autotrade("autotrade_dispatch", "session_block", detail, broker_time=session_guard["broker_time"])
+            return HTTPStatus.OK.value, {"status": "session_block", **session_guard}
         broker_now = get_dashboard_now()
         blocked_weekday = AUTOTRADE_BLOCKED_WEEKDAYS.get(broker_now.weekday())
         if blocked_weekday:
@@ -4590,7 +4674,8 @@ def maybe_sync_google_sheet_after_close() -> None:
             push_to_google_sheet,
             push_to_webhook,
         )
-    except Exception:
+    except Exception as error:
+        print(f"Google Sheets sync disabled: could not load configuration ({error}).")
         return
 
     direct_enabled = bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID)
@@ -4601,6 +4686,7 @@ def maybe_sync_google_sheet_after_close() -> None:
     try:
         history = fetch_closed_deals_history(period="all")
     except Exception as error:
+        print(f"Google Sheets sync could not read master history: {error}")
         append_ai_logic_audit(
             build_ai_logic_event(
                 "google_sheet_sync",
@@ -4644,6 +4730,7 @@ def maybe_sync_google_sheet_after_close() -> None:
         with AUTOTRADE_LOCK:
             AUTOTRADE_STATE["last_sheet_sync_ticket"] = latest_ticket
         save_last_sheet_sync_ticket(latest_ticket)
+        print(f"Google Sheets synced after closed master ticket {latest_ticket}.")
         append_ai_logic_audit(
             build_ai_logic_event(
                 "google_sheet_sync",
@@ -4655,6 +4742,7 @@ def maybe_sync_google_sheet_after_close() -> None:
             )
         )
     except Exception as error:
+        print(f"Google Sheets sync failed: {error}")
         append_ai_logic_audit(
             build_ai_logic_event(
                 "google_sheet_sync",
@@ -5241,6 +5329,21 @@ def google_sheet_sync_worker() -> None:
         time.sleep(GOOGLE_SHEET_SYNC_INTERVAL_SECONDS)
 
 
+def google_sheet_sync_startup_status() -> str:
+    """A non-sensitive readiness message for the server console."""
+    try:
+        from google_sheet_sync import WEBHOOK_URL, GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID
+    except Exception as error:
+        return f"Google Sheets sync unavailable: {error}"
+    if WEBHOOK_URL:
+        return "Google Sheets sync configured through webhook."
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
+        return "Google Sheets sync disabled: set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID in this PowerShell window."
+    if not Path(GOOGLE_SERVICE_ACCOUNT_JSON).is_file():
+        return "Google Sheets sync disabled: GOOGLE_SERVICE_ACCOUNT_JSON does not point to a file."
+    return "Google Sheets sync configured with local service-account credentials."
+
+
 class AppHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(FRONTEND_ROOT), **kwargs)
@@ -5797,6 +5900,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 "active_trade": AUTOTRADE_STATE["active_trade"],
                 "cooldown_remaining_seconds": get_cooldown_remaining_seconds(),
                 "cooldown_seconds": AUTOTRADE_COOLDOWN_SECONDS,
+                "entry_session_guard": entry_time_guard_status(),
                 "news_calendar": build_news_calendar_status(),
             }
         self.respond_json(HTTPStatus.OK, payload)
@@ -5928,6 +6032,10 @@ class AppHandler(SimpleHTTPRequestHandler):
 
         # --- Entry signals ---
         if action in {"buy", "sell"}:
+            session_guard = entry_time_guard_status()
+            if bool(session_guard["blocked"]):
+                self.respond_json(HTTPStatus.OK, {"status": "session_block", **session_guard})
+                return
             active_trade = AUTOTRADE_STATE.get("active_trade")
             if AUTOTRADE_STATE.get("trade_active") and isinstance(active_trade, dict):
                 active_side = str(active_trade.get("side", "") or "")
@@ -6047,6 +6155,7 @@ def main() -> None:
         print("Autonomous AI loop disabled by default.")
     print(f"Server SMC trade loop active for {SERVER_SMC_SYMBOL} every {SERVER_SMC_INTERVAL_SECONDS} seconds.")
     print(f"Google Sheets sync worker active every {GOOGLE_SHEET_SYNC_INTERVAL_SECONDS} seconds.")
+    print(google_sheet_sync_startup_status())
     print("Keep this terminal window open while using the site.")
     try:
         server.serve_forever()

@@ -23,6 +23,21 @@ def linked_user(chat_id: str):
         return connection.execute("SELECT users.id, users.email FROM telegram_links JOIN users ON users.id = telegram_links.user_id WHERE telegram_links.chat_id = ?", (chat_id,)).fetchone()
 
 
+def deliver_pending_notifications(token: str) -> None:
+    """Deliver follower execution alerts from the shared local outbox."""
+    with AUTH_LOCK, auth_connection() as connection:
+        rows = connection.execute("SELECT outbox.id, outbox.message, links.chat_id, COALESCE(prefs.trade_alerts, 1) AS trade_alerts FROM notification_outbox AS outbox LEFT JOIN telegram_links AS links ON links.user_id = outbox.user_id LEFT JOIN notification_preferences AS prefs ON prefs.user_id = outbox.user_id WHERE outbox.sent_at IS NULL ORDER BY outbox.created_at LIMIT 20").fetchall()
+    for row in rows:
+        # Muted or unpaired accounts should not receive an old alert later.
+        if not row["chat_id"] or not row["trade_alerts"]:
+            with AUTH_LOCK, auth_connection() as connection:
+                connection.execute("UPDATE notification_outbox SET sent_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), row["id"]))
+            continue
+        reply(token, str(row["chat_id"]), str(row["message"]))
+        with AUTH_LOCK, auth_connection() as connection:
+            connection.execute("UPDATE notification_outbox SET sent_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), row["id"]))
+
+
 def live_master_copy_status() -> dict[str, object]:
     """Read state from the actual `python server.py` runtime.
 
@@ -34,6 +49,15 @@ def live_master_copy_status() -> dict[str, object]:
     if callable(getter):
         return getter()
     return {"autotrade_enabled": False, "trade_active": False, "server_loop_status": "unavailable", "server_loop_detail": "Master runtime unavailable", "last_run_at": 0}
+
+
+def live_broker_now() -> datetime:
+    """Use the actual server process's broker clock, not this import copy."""
+    runtime = sys.modules.get("__main__")
+    getter = getattr(runtime, "get_broker_now", None)
+    if callable(getter):
+        return getter()
+    return datetime.now(timezone.utc)
 
 
 HELP = """⚡ QUANTUM FAMILY CONTROL
@@ -53,8 +77,8 @@ Use the buttons below for status and copying controls.
 /master — check whether the master bot and its auto-trading are live
 
 To update exposure, send:
-/change LOT ENTRIES
-Example: /change 0.05 1
+/change LOT ENTRIES_PER_MASTER_TRADE
+Example: /change 0.05 1 (one copied order for each new master trade)
 
 Then tap ✅ Confirm Changes.
 
@@ -62,9 +86,8 @@ Then tap ✅ Confirm Changes.
 
 
 def history_range(parts: list[str]):
-    myt = timezone(timedelta(hours=8))
-    now = datetime.now(myt)
-    boundary = now.replace(hour=5, minute=0, second=0, microsecond=0)
+    now = live_broker_now()
+    boundary = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if now < boundary:
         boundary -= timedelta(days=1)
     scope = parts[1].lower() if len(parts) > 1 else ""
@@ -77,8 +100,8 @@ def history_range(parts: list[str]):
         start = boundary.replace(day=1)
         return start, boundary + timedelta(days=1), "THIS MONTH"
     if len(parts) == 3:
-        start = datetime.strptime(parts[1], "%Y-%m-%d").replace(tzinfo=myt, hour=5)
-        end = datetime.strptime(parts[2], "%Y-%m-%d").replace(tzinfo=myt, hour=5) + timedelta(days=1)
+        start = datetime.strptime(parts[1], "%Y-%m-%d").replace(tzinfo=now.tzinfo, hour=0)
+        end = datetime.strptime(parts[2], "%Y-%m-%d").replace(tzinfo=now.tzinfo, hour=0) + timedelta(days=1)
         if end <= start: raise ValueError
         return start, end, f"{parts[1]} → {parts[2]}"
     raise ValueError
@@ -88,13 +111,13 @@ def history_message(user_id: str, parts: list[str]) -> str:
     try:
         start, end, label = history_range(parts)
     except ValueError:
-        return "📚 TRADE HISTORY\n\nChoose: /history today, yesterday, week, or month\nCustom: /history 2026-09-01 2026-09-05\n\nEach period runs from 5:00 AM MYT."
+        return "📚 TRADE HISTORY\n\nChoose: /history today, yesterday, week, or month\nCustom: /history 2026-09-01 2026-09-05\n\nEach period follows broker midnight (00:00 Broker Time)."
     with AUTH_LOCK, auth_connection() as connection:
         summary = connection.execute("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END), 0) AS wins, COALESCE(SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END), 0) AS losses, COALESCE(SUM(net_profit), 0) AS pnl, COALESCE(AVG(CASE WHEN net_profit > 0 THEN net_profit END), 0) AS avg_win, COALESCE(AVG(CASE WHEN net_profit < 0 THEN net_profit END), 0) AS avg_loss, COALESCE(MAX(net_profit), 0) AS best, COALESCE(MIN(net_profit), 0) AS worst FROM copy_trade_ledger WHERE user_id = ? AND closed_at >= ? AND closed_at < ?", (user_id, start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat())).fetchone()
         rows = connection.execute("SELECT symbol, side, volume, net_profit, outcome, closed_at FROM copy_trade_ledger WHERE user_id = ? AND closed_at >= ? AND closed_at < ? ORDER BY closed_at DESC LIMIT 6", (user_id, start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat())).fetchall()
     total = int(summary["total"])
     rate = (float(summary["wins"]) / total * 100) if total else 0
-    lines = [f"📚 {label} — 5:00 AM MYT", "", f"Closed trades: {total}", f"Wins / Losses: {summary['wins']} / {summary['losses']}", f"Win rate: {rate:.1f}%", f"Net P/L: {float(summary['pnl']):+.2f}", f"Average win / loss: {float(summary['avg_win']):+.2f} / {float(summary['avg_loss']):+.2f}", f"Best / worst: {float(summary['best']):+.2f} / {float(summary['worst']):+.2f}"]
+    lines = [f"📚 {label} — Broker Time", "", f"Closed trades: {total}", f"Wins / Losses: {summary['wins']} / {summary['losses']}", f"Win rate: {rate:.1f}%", f"Net P/L: {float(summary['pnl']):+.2f}", f"Average win / loss: {float(summary['avg_win']):+.2f} / {float(summary['avg_loss']):+.2f}", f"Best / worst: {float(summary['best']):+.2f} / {float(summary['worst']):+.2f}"]
     if rows:
         lines += ["", "Latest closed trades:"]
         lines += [f"{'✅' if row['outcome'] == 'win' else '❌' if row['outcome'] == 'loss' else '➖'} {row['symbol']} {str(row['side']).upper()} • {row['volume']} lot • {float(row['net_profit']):+.2f}" for row in rows]
@@ -161,7 +184,7 @@ def handle(token: str, chat_id: str, text: str):
         enabled = 0 if command == "/mute" else 1
         with AUTH_LOCK, auth_connection() as connection:
             connection.execute("INSERT INTO notification_preferences (user_id, trade_alerts) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET trade_alerts = excluded.trade_alerts", (user["id"], enabled))
-        return reply(token, chat_id, "🔕 Real-time trade execution and closure alerts are muted. Your 5:00 AM MYT daily summary will still be sent." if not enabled else "🔔 Real-time trade alerts are back on. Daily summaries remain enabled.")
+        return reply(token, chat_id, "🔕 Real-time trade execution and closure alerts are muted. Your broker-midnight daily summary will still be sent." if not enabled else "🔔 Real-time trade alerts are back on. Daily summaries remain enabled.")
     if command == "/cancel_settings":
         with AUTH_LOCK, auth_connection() as connection:
             connection.execute("UPDATE copy_settings SET pending_lot = NULL, pending_max_entries = NULL, updated_at = ? WHERE user_id = ?", (datetime.now(timezone.utc).isoformat(), user["id"]))
@@ -180,12 +203,13 @@ def handle(token: str, chat_id: str, text: str):
             lot, entries = round(float(parts[1]), 2), int(parts[2])
             if not 0.01 <= lot <= 100 or not 1 <= entries <= 10: raise ValueError
         except ValueError:
-            return reply(token, chat_id, "Use /change LOT ENTRIES, for example /change 0.02 1")
+            return reply(token, chat_id, "Use /change LOT ENTRIES_PER_MASTER_TRADE, for example /change 0.02 1")
         with AUTH_LOCK, auth_connection() as connection:
             connection.execute("INSERT INTO copy_settings (user_id, pending_lot, pending_max_entries, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET pending_lot = excluded.pending_lot, pending_max_entries = excluded.pending_max_entries, updated_at = excluded.updated_at", (user["id"], lot, entries, datetime.now(timezone.utc).isoformat()))
-        return reply(token, chat_id, f"Settings staged:\n• Lot size: {lot}\n• Maximum entries: {entries}\n\nSend /confirm to apply these only to the next new master trade. Current positions, TP, and SL will not change.")
+        entry_label = "entry" if entries == 1 else "entries"
+        return reply(token, chat_id, f"Settings staged:\n• Lot size per entry: {lot}\n• {entries} {entry_label} per master trade\n\nThis opens up to {entries} same-direction copied order(s) when one new master trade is opened. Existing copied trades do not reduce this limit. Send /confirm to apply these only to the next new master trade. Current positions, TP, and SL will not change.")
     if command == "/change":
-        return reply(token, chat_id, "⚙ CHANGE SETTINGS\n\nSend: /change LOT ENTRIES\nExample: /change 0.05 1\n\nYour changes will remain pending until you tap ✅ Confirm Changes.")
+        return reply(token, chat_id, "⚙ CHANGE SETTINGS\n\nSend: /change LOT ENTRIES_PER_MASTER_TRADE\nExample: /change 0.05 1\n\nWith 1, every new master trade opens exactly one copied order. Your changes remain pending until you tap ✅ Confirm Changes.")
     if command == "/confirm":
         with AUTH_LOCK, auth_connection() as connection:
             connection.execute("UPDATE copy_settings SET active_lot = pending_lot, active_max_entries = pending_max_entries, pending_lot = NULL, pending_max_entries = NULL, updated_at = ? WHERE user_id = ? AND pending_lot IS NOT NULL", (datetime.now(timezone.utc).isoformat(), user["id"]))
@@ -197,7 +221,10 @@ def telegram_worker(token: str):
     offset = 0
     while True:
         try:
-            updates = api(token, "getUpdates", {"offset": offset, "timeout": 25}).get("result", [])
+            deliver_pending_notifications(token)
+            # A short poll keeps follower trade-open and trade-close alerts
+            # near real-time while still avoiding busy polling.
+            updates = api(token, "getUpdates", {"offset": offset, "timeout": 5}).get("result", [])
             for update in updates:
                 offset = int(update["update_id"]) + 1
                 message = update.get("message", {})
