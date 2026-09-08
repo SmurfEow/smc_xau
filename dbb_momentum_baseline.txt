@@ -6,8 +6,11 @@ length       = input.int(20, "BB Length")
 src          = input(close, "Source")
 mult1        = input.float(1.0, "Inner Mult (1SD)")
 mult2        = input.float(2.0, "Outer Mult (2SD)")
-minHoldBars  = input.int(5, "Min Hold Bars (before exit allowed)", minval=1)
-expandThresh  = input.float(1.02, "Band Expansion Threshold", minval=1.0, step=0.01)
+minHoldBars  = input.int(3, "Min Hold Bars (before exit allowed)", minval=1)
+expandThresh  = input.float(1.04, "Band Expansion Threshold", minval=1.0, step=0.01)
+stopDistance = input.float(18.0, "Fixed Stop Distance", minval=0.1, step=0.1)
+trendLookback = input.int(8, "Basis Trend Lookback", minval=1)
+minBreakoutWidthRatio = input.float(0.08, "Min Breakout Width Ratio", minval=0.0, step=0.01)
 
 // --- Calculations ---
 basis = ta.sma(src, length)
@@ -24,6 +27,9 @@ l2 = basis - dev2
 // --- Band Expansion Filter ---
 bbWidth   = u1 - l1
 expanding = bbWidth > bbWidth[1] * expandThresh
+basisRising = basis > basis[trendLookback]
+basisFalling = basis < basis[trendLookback]
+minBreakoutDistance = bbWidth * minBreakoutWidthRatio
 
 // --- Min Hold Tracker ---
 var int barsSinceLongEntry  = 0
@@ -54,8 +60,8 @@ fill(p_u1, p_u2, color=color.new(color.green, 90), title="Bullish Momentum")
 fill(p_l1, p_l2, color=color.new(color.red, 90), title="Bearish Momentum")
 
 // --- Shared Signals ---
-longEntrySignal  = strategy.position_size == 0 and ta.crossover(close, u1) and expanding
-shortEntrySignal = strategy.position_size == 0 and ta.crossunder(close, l1) and expanding
+longEntrySignal  = strategy.position_size == 0 and ta.crossover(close, u1) and expanding and basisRising and close >= u1 + minBreakoutDistance
+shortEntrySignal = strategy.position_size == 0 and ta.crossunder(close, l1) and expanding and basisFalling and close <= l1 - minBreakoutDistance
 longExitSignal   = strategy.position_size > 0 and ta.crossunder(close, u1) and barsSinceLongEntry >= minHoldBars
 shortExitSignal  = strategy.position_size < 0 and ta.crossover(close, l1) and barsSinceShortEntry >= minHoldBars
 
@@ -65,6 +71,13 @@ if longEntrySignal
 
 if shortEntrySignal
     strategy.entry("DBB Short", strategy.short)
+
+// --- Fixed Stop Loss Logic ---
+if strategy.position_size > 0
+    strategy.exit("DBB Long Fixed SL", "DBB Long", stop=strategy.position_avg_price - stopDistance)
+
+if strategy.position_size < 0
+    strategy.exit("DBB Short Fixed SL", "DBB Short", stop=strategy.position_avg_price + stopDistance)
 
 // --- Exit Logic ---
 if longExitSignal

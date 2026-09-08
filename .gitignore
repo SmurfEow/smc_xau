@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+quantum_auth.sqlite3
+.env
+.env.*
+*service-account*.json
+google-service-account*.json

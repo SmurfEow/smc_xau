@@ -23,10 +23,11 @@ DEFAULT_MAGIC = int(os.getenv("QUANTUM_SHEET_MAGIC", os.getenv("AUTOTRADE_MAGIC"
 DEFAULT_SOURCE = os.getenv("QUANTUM_TRADE_SOURCE", "").strip()
 WEBHOOK_URL = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("GOOGLE_SHEETS_WEBHOOK_SECRET", "").strip()
-DEFAULT_SERVICE_ACCOUNT_JSON = r"C:\Users\User\Downloads\xauusdregime-bda2270705f3.json"
-DEFAULT_GOOGLE_SHEET_ID = "1XDNo6mnh7IAxE7mLpuGpF8jAr-sZ43gL0jiB2c6meIo"
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", DEFAULT_SERVICE_ACCOUNT_JSON).strip()
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", DEFAULT_GOOGLE_SHEET_ID).strip()
+# Never embed a private credential path or spreadsheet ID in source control.
+# A fresh clone has Google Sheets sync disabled until its owner deliberately
+# supplies both values in their local environment.
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "profit_calendar").strip() or "profit_calendar"
 CALENDAR_WEEKDAY_HEADERS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 GOOGLE_SCOPES = [

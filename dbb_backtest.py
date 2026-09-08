@@ -1,6 +1,6 @@
 """
 DBB Backtest — uses yfinance historical data (no MT5 needed)
-Matches server.py logic: SMA20, 1SD/2SD bands, expansion 1.02, min hold 5 bars
+Matches server.py logic: SMA20, 1SD/2SD bands, expansion 1.04, min hold 3 bars
 """
 
 import sys
@@ -22,8 +22,11 @@ SPREAD          = 0.30        # dollars per trade
 LENGTH          = 20
 MULT1           = 1.0
 MULT2           = 2.0
-MIN_HOLD_BARS   = 5
-EXPAND_THRESH   = 1.02
+MIN_HOLD_BARS   = 3
+EXPAND_THRESH   = 1.04
+STOP_DISTANCE   = 18.0
+TREND_LOOKBACK_BARS = 8
+MIN_BREAKOUT_WIDTH_RATIO = 0.08
 LAST_ENTRY_HOUR = 22
 INITIAL_CAPITAL = 10_000
 
@@ -54,6 +57,9 @@ def compute_dbb(df: pd.DataFrame) -> pd.DataFrame:
     df["l2"]    = df["basis"] - MULT2 * df["std"]
     df["width"] = df["u1"] - df["l1"]
     df["expanding"] = df["width"] > df["width"].shift(1) * EXPAND_THRESH
+    df["basis_rising"] = df["basis"] > df["basis"].shift(TREND_LOOKBACK_BARS)
+    df["basis_falling"] = df["basis"] < df["basis"].shift(TREND_LOOKBACK_BARS)
+    df["min_breakout_distance"] = df["width"] * MIN_BREAKOUT_WIDTH_RATIO
     return df
 
 
@@ -72,13 +78,31 @@ def run_backtest(df: pd.DataFrame) -> list[dict]:
         if position is not None:
             bars_held += 1
 
+        # --- Hard stop logic ---
+        if position is not None:
+            if position["side"] == "long" and row["low"] <= position["stop"]:
+                exit_price = position["stop"] - SPREAD / 2
+                pnl = (exit_price - position["entry"]) * POINT_VALUE
+                trades.append(_make_trade(position, row.name, exit_price, bars_held, pnl, exit_reason="stop"))
+                position = None
+                bars_held = 0
+                continue
+
+            if position["side"] == "short" and row["high"] >= position["stop"]:
+                exit_price = position["stop"] + SPREAD / 2
+                pnl = (position["entry"] - exit_price) * POINT_VALUE
+                trades.append(_make_trade(position, row.name, exit_price, bars_held, pnl, exit_reason="stop"))
+                position = None
+                bars_held = 0
+                continue
+
         # --- Exit logic ---
         if position is not None and bars_held >= MIN_HOLD_BARS:
             if position["side"] == "long":
                 if prev["close"] >= prev["u1"] and row["close"] < row["u1"]:
                     exit_price = row["close"] - SPREAD / 2
                     pnl = (exit_price - position["entry"]) * POINT_VALUE
-                    trades.append(_make_trade(position, row.name, exit_price, bars_held, pnl))
+                    trades.append(_make_trade(position, row.name, exit_price, bars_held, pnl, exit_reason="dynamic"))
                     position = None
                     bars_held = 0
 
@@ -86,18 +110,22 @@ def run_backtest(df: pd.DataFrame) -> list[dict]:
                 if prev["close"] <= prev["l1"] and row["close"] > row["l1"]:
                     exit_price = row["close"] + SPREAD / 2
                     pnl = (position["entry"] - exit_price) * POINT_VALUE
-                    trades.append(_make_trade(position, row.name, exit_price, bars_held, pnl))
+                    trades.append(_make_trade(position, row.name, exit_price, bars_held, pnl, exit_reason="dynamic"))
                     position = None
                     bars_held = 0
 
         # --- Entry logic ---
         if position is None and entry_window_open and bool(row["expanding"]):
-            if prev["close"] <= prev["u1"] and row["close"] > row["u1"]:
-                position = {"side": "long",  "entry": row["close"] + SPREAD / 2, "entry_time": row.name}
+            long_breakout_ok = row["close"] >= row["u1"] + row["min_breakout_distance"]
+            short_breakout_ok = row["close"] <= row["l1"] - row["min_breakout_distance"]
+            if prev["close"] <= prev["u1"] and row["close"] > row["u1"] and bool(row["basis_rising"]) and long_breakout_ok:
+                entry = row["close"] + SPREAD / 2
+                position = {"side": "long",  "entry": entry, "stop": entry - STOP_DISTANCE, "entry_time": row.name}
                 bars_held = 0
 
-            elif prev["close"] >= prev["l1"] and row["close"] < row["l1"]:
-                position = {"side": "short", "entry": row["close"] - SPREAD / 2, "entry_time": row.name}
+            elif prev["close"] >= prev["l1"] and row["close"] < row["l1"] and bool(row["basis_falling"]) and short_breakout_ok:
+                entry = row["close"] - SPREAD / 2
+                position = {"side": "short", "entry": entry, "stop": entry + STOP_DISTANCE, "entry_time": row.name}
                 bars_held = 0
 
     # Close any open position at last bar
@@ -111,7 +139,7 @@ def run_backtest(df: pd.DataFrame) -> list[dict]:
     return trades
 
 
-def _make_trade(pos, exit_time, exit_price, bars, pnl, open_trade=False):
+def _make_trade(pos, exit_time, exit_price, bars, pnl, open_trade=False, exit_reason="final"):
     return {
         "side":       pos["side"],
         "entry_time": pos["entry_time"],
@@ -121,6 +149,7 @@ def _make_trade(pos, exit_time, exit_price, bars, pnl, open_trade=False):
         "bars":       bars,
         "pnl":        pnl,
         "open":       open_trade,
+        "exit_reason": exit_reason,
     }
 
 
