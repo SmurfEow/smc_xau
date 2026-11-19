@@ -139,7 +139,7 @@ AUTOTRADE_BLOCKED_WEEKDAYS = {3: "Thursday", 4: "Friday"}
 # automatically shifts whenever the broker's UTC offset changes.
 AUTOTRADE_ASIA_BLOCK_START_UTC_HOUR = 0
 AUTOTRADE_ASIA_BLOCK_END_UTC_HOUR = 7
-ONE_TIME_WINDOW_INTERVAL_SECONDS = 10
+ONE_TIME_WINDOW_INTERVAL_SECONDS = 1
 ONE_TIME_WINDOW_SYMBOL = os.environ.get("ONE_TIME_WINDOW_SYMBOL", "XAUUSD").strip() or "XAUUSD"
 ONE_TIME_WINDOW_MODEL = "one-time-window-m15-m5"
 SERVER_SMC_CONTEXT_BARS = 500
@@ -3415,7 +3415,12 @@ def evaluate_autotrade_signal(
             return HTTPStatus.OK.value, {"status": "duplicate", "detail": detail}
         AUTOTRADE_STATE["last_attempt_at"] = now
 
-    result = place_market_order(normalized_symbol, normalized_side, lot_value, sl_value, tp_value)
+    result = place_market_order(
+        normalized_symbol, normalized_side, lot_value, sl_value, tp_value,
+        tp_rr=1.5 if action == "server_one_time_window_m15_m5" else None,
+        min_risk_distance=7.0 if action == "server_one_time_window_m15_m5" else None,
+        max_risk_distance=12.0 if action == "server_one_time_window_m15_m5" else None,
+    )
     if result.get("status") == "placed":
         result["copy_recipients"] = queue_copy_open(result)
     log_autotrade(
@@ -4391,7 +4396,7 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
         if candle_time + 15 * 60 <= now_ts and local_time.hour == 8 and local_time.minute == 15:
             range_candles.append(candle)
     if not range_candles:
-        return {"status": "waiting", "detail": "Waiting for the closed 08:15 New York M15 window candle."}
+        return {"status": "waiting", "detail": "Waiting for the closed 08:15 UTC−5 M15 window candle."}
 
     range_candle = max(range_candles, key=lambda candle: int(_num(candle.get("time"))))
     range_time = int(_num(range_candle.get("time")))
@@ -4418,14 +4423,26 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
             breakout_index, side = index, "sell"
             break
     if breakout_index is None or side is None:
-        return {"status": "hold", "detail": "Window is set; waiting for the first closed M5 breakout."}
+        return {"status": "hold", "detail": "Window is set; waiting for the first M5 candle body to close fully outside the range."}
 
     breakout = closed_m5[breakout_index]
-    entry = float(_num(breakout.get("close")))
-    stop = None
+    breakout_time = int(_num(breakout.get("time")))
+    entry_bar_time = breakout_time + 5 * 60
+    tick = fetch_tick(resolved_symbol)
+    tick_time = int(_num(tick.get("time")))
+    if tick_time < entry_bar_time:
+        return {"status": "waiting", "detail": "Breakout confirmed; waiting for the next M5 candle to start before entering."}
+    if tick_time >= entry_bar_time + 90:
+        return {"status": "stale", "detail": "The next M5 candle's immediate-entry window has passed; this setup is skipped."}
+
+    entry = float(_num(tick.get("ask" if side == "buy" else "bid")))
+    structural_stops = []
     for index in range(breakout_index - 2, 1, -1):
         neighborhood = closed_m5[index - 2:index + 3]
-        if len(neighborhood) != 5 or any(float(_num(item.get("high"))) > range_high or float(_num(item.get("low"))) < range_low for item in neighborhood):
+        if len(neighborhood) != 5 or any(
+            float(_num(item.get("high"))) > range_high or float(_num(item.get("low"))) < range_low
+            for item in neighborhood
+        ):
             continue
         pivot = closed_m5[index]
         if side == "buy":
@@ -4446,24 +4463,31 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
             )
             candidate = float(_num(pivot.get("high")))
             valid_side = candidate > entry
-        if is_swing and valid_side:
-            stop = candidate
-            break
+        if not (is_swing and valid_side):
+            continue
+        risk = abs(entry - candidate)
+        if 7 <= risk <= 12:
+            structural_stops.append((candidate, risk))
 
+    chosen_stop = next((item for item in structural_stops if item[1] <= 10), None)
+    if chosen_stop is None and structural_stops:
+        chosen_stop = structural_stops[0]
     stop_source = "inside-range swing"
+    stop = chosen_stop[0] if chosen_stop else None
     if stop is None:
-        stop_source = "opposite range boundary"
-        stop = range_low if side == "buy" else range_high
+        boundary = range_low if side == "buy" else range_high
+        boundary_risk = abs(entry - boundary)
+        if 7 <= boundary_risk <= 12:
+            stop = boundary
+            stop_source = "opposite range boundary"
+    if stop is None:
+        detail = "First breakout has no structural stop within the allowed 7–12 price risk. Setup skipped."
+        return {"status": "no_valid_stop", "detail": detail}
+
     risk = abs(entry - stop)
-    if not math.isfinite(risk) or risk <= 0:
-        return {"status": "hold", "detail": "First breakout has no valid stop distance; no trade plan was produced."}
     target = entry + risk * 1.5 if side == "buy" else entry - risk * 1.5
-    breakout_time = int(_num(breakout.get("time")))
-    signal_close_time = breakout_time + 5 * 60
-    if now_ts < signal_close_time or now_ts - signal_close_time > 90:
-        return {"status": "stale", "detail": "Breakout signal is outside the 90-second execution window."}
     signal_id = f"one-time-window:{breakout_time}:{side}"
-    detail = f"One Time Window {side.upper()} after the first fully closed M5 body breakout. Stop uses {stop_source}; target is 1.5R."
+    detail = f"One Time Window {side.upper()}: M5 body breakout confirmed; market entry on next M5 candle. Stop uses {stop_source}; risk 7–12 (prefer 7–10); target is 1.5R."
     append_ai_logic_audit(
         build_ai_logic_event(
             "one_time_window_signal", "ready", resolved_symbol, detail=detail,
@@ -4478,8 +4502,9 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
         action="server_one_time_window_m15_m5",
         ai_trade={
             "decision": side, "setup_type": "One Time Window",
-            "trigger_state": "m5_body_closed_outside_range", "trigger_summary": detail,
-            "execution_summary": f"Entry {entry:.2f}; SL {stop:.2f} ({stop_source}); TP {target:.2f} (1.5R).",
+            "trigger_state": "m5_body_closed_outside_range_next_bar_entry",
+            "trigger_summary": detail,
+            "execution_summary": f"Entry on next M5 bar at current MT5 {side} quote {entry:.2f}; SL {stop:.2f} ({stop_source}); TP {target:.2f} (1.5R).",
             "model": ONE_TIME_WINDOW_MODEL, "strategy_version": "one-time-window-m15-m5",
         },
     )
@@ -4600,6 +4625,9 @@ def place_market_order(
     sl: float | None,
     tp: float | None,
     sl_distance: float | None = None,
+    tp_rr: float | None = None,
+    min_risk_distance: float | None = None,
+    max_risk_distance: float | None = None,
 ) -> dict[str, object]:
     with MT5_LOCK:
         if not mt5.initialize():
@@ -4625,13 +4653,23 @@ def place_market_order(
             digits = int(getattr(symbol_info, "digits", 2) or 2)
             volume = normalize_volume(symbol_info, lot)
             price = float(tick.ask if side == "buy" else tick.bid)
+            if sl is None and sl_distance is not None and sl_distance > 0:
+                sl = price - sl_distance if side == "buy" else price + sl_distance
+            if min_risk_distance is not None or max_risk_distance is not None:
+                if sl is None:
+                    return {"status": "rejected", "detail": "A structural stop is required for this strategy.", "symbol": resolved_symbol}
+                live_risk = abs(price - float(sl))
+                lower_risk = float(min_risk_distance or 0.0)
+                upper_risk = float(max_risk_distance) if max_risk_distance is not None else float("inf")
+                if live_risk < lower_risk or live_risk > upper_risk:
+                    return {"status": "rejected", "detail": f"Live MT5 entry changes stop risk to {live_risk:.2f}; allowed risk is {lower_risk:.2f}–{upper_risk:.2f}.", "symbol": resolved_symbol, "price": round(price, digits), "sl": sl}
+                if tp_rr is not None and tp_rr > 0:
+                    tp = price + live_risk * tp_rr if side == "buy" else price - live_risk * tp_rr
             if sl is not None and tp is not None:
                 valid_plan = float(sl) < price < float(tp) if side == "buy" else float(tp) < price < float(sl)
                 if not valid_plan:
                     return {"status": "rejected", "detail": "SL/TP levels no longer bracket the live MT5 entry price.", "symbol": resolved_symbol, "price": round(price, digits), "sl": sl, "tp": tp}
             order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
-            if sl is None and sl_distance is not None and sl_distance > 0:
-                sl = price - sl_distance if side == "buy" else price + sl_distance
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "magic": AUTOTRADE_MAGIC,
@@ -6107,7 +6145,14 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
 
             try:
-                result = place_market_order(symbol, action, lot, sl=sl, tp=tp, sl_distance=DBB_FIXED_STOP_DISTANCE if sl is None else None)
+                is_one_time_window = str(payload.get("strategy", "") or "").strip().lower() == "one_time_window"
+                result = place_market_order(
+                    symbol, action, lot, sl=sl, tp=tp,
+                    sl_distance=DBB_FIXED_STOP_DISTANCE if sl is None else None,
+                    tp_rr=1.5 if is_one_time_window else None,
+                    min_risk_distance=7.0 if is_one_time_window else None,
+                    max_risk_distance=12.0 if is_one_time_window else None,
+                )
                 if result.get("status") == "placed":
                     result["copy_recipients"] = queue_copy_open(result)
             except Exception as error:
