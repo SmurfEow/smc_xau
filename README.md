@@ -43,7 +43,10 @@ The dashboard separates cheap live updates from heavier sync work:
 
 - `/api/tick` is polled every 1 second.
 - The latest forming candle is patched from live tick price.
-- Recent MT5 candles sync every 2 seconds.
+- M5 and M15 each load all candle history available from MT5 when the dashboard opens. The charts open near the newest bars and can be panned/zoomed back through the loaded history.
+- M1 and H1 retain the smaller 500-bar context window.
+- The `/api/tick` stream updates the newest forming M5/M15 candle once per second; historical candles stay fixed until a candle closes.
+- Only the recent candle tail syncs every 15 seconds, so the dashboard does not redraw the full history on each tick.
 - Heavier AI/board context refreshes less often to reduce chart lag.
 
 Chart overlays show the One Time Window high/low and, after a breakout, the entry, conditional stop, 1.5R target, and direction marker.
