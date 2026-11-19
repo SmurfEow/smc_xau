@@ -18,21 +18,22 @@ The Python server is the MT5/API engine. The Neural Alpha dashboard is the live 
 
 | Parameter | Value |
 |---|---|
+| Clock | Fixed UTC-5 year-round |
 | Range timeframe | M15 |
-| Range candle | 08:15–08:30 New York time |
+| Range candle | Candle opened at 08:15 New York time; its high and low define the daily window |
 | Trigger timeframe | M5 |
-| Trigger | First closed M5 candle whose close is outside the range |
+| Trigger | First closed M5 body entirely above the high or entirely below the low |
 | Reward | 1.5R |
 | Stop | Latest confirmed inside-range M5 swing; opposite range boundary if no usable swing exists |
 
 ### Entry and Stop Logic
 
-- The high and low of the closed 08:15 New York M15 candle define the daily window.
-- After 08:30, the first closed M5 candle that closes above the high triggers a buy; the first candle that closes below the low triggers a sell.
-- For a buy, the stop uses the latest confirmed M5 swing low formed inside the range. For a sell, it uses the latest confirmed swing high formed inside the range.
-- If there is no usable inside-range swing, the stop falls back to the opposite edge of the M15 range.
-- The target is 1.5 times the entry-to-stop distance. If there is no valid risk distance, no trade plan is produced.
-- New York time uses `America/New_York`, including daylight-saving changes.
+- Use the M15 candle that opens at 08:15 under fixed UTC-5. Its high and low become valid after it closes at 08:30.
+- Ignore wick-only breaks. A buy requires both the M5 candle open and close to be above the range high. A sell requires both open and close to be below the range low.
+- For a buy, place the stop at the latest confirmed M5 swing low formed inside the range. For a sell, use the latest confirmed swing high formed inside the range.
+- If there is no usable inside-range swing, place the stop at the opposite edge of the M15 range.
+- Set the stop first, then calculate the target at 1.5 times the entry-to-stop risk. If risk is invalid, no trade plan is produced.
+- The chart draws each day's high and low, plus any breakout entry, stop, and target, only through that day's 17:00 New York session close.
 
 ---
 
