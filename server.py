@@ -139,13 +139,13 @@ AUTOTRADE_BLOCKED_WEEKDAYS = {3: "Thursday", 4: "Friday"}
 # automatically shifts whenever the broker's UTC offset changes.
 AUTOTRADE_ASIA_BLOCK_START_UTC_HOUR = 0
 AUTOTRADE_ASIA_BLOCK_END_UTC_HOUR = 7
-SERVER_SMC_INTERVAL_SECONDS = 10
-SERVER_SMC_SYMBOL = os.environ.get("SERVER_SMC_SYMBOL", "XAUUSD").strip() or "XAUUSD"
-SERVER_SMC_MODEL = "server-smc-june10-reconstructed"
+ONE_TIME_WINDOW_INTERVAL_SECONDS = 10
+ONE_TIME_WINDOW_SYMBOL = os.environ.get("ONE_TIME_WINDOW_SYMBOL", "XAUUSD").strip() or "XAUUSD"
+ONE_TIME_WINDOW_MODEL = "one-time-window-m15-m5"
 SERVER_SMC_CONTEXT_BARS = 500
 SERVER_SMC_ENABLE_BOS_CONTINUATION = False
 SERVER_SMC_ALLOW_SAME_SIGNAL_REENTRY = True
-SERVER_SMC_STATE = {
+ONE_TIME_WINDOW_STATE = {
     "last_run_at": 0.0,
     "last_status": "",
     "last_detail": "",
@@ -350,9 +350,9 @@ def master_copy_status() -> dict[str, object]:
     return {
         "autotrade_enabled": autotrade_enabled,
         "trade_active": trade_active,
-        "server_loop_status": str(SERVER_SMC_STATE.get("last_status", "starting") or "starting"),
-        "server_loop_detail": str(SERVER_SMC_STATE.get("last_detail", "") or ""),
-        "last_run_at": float(SERVER_SMC_STATE.get("last_run_at", 0) or 0),
+        "server_loop_status": str(ONE_TIME_WINDOW_STATE.get("last_status", "starting") or "starting"),
+        "server_loop_detail": str(ONE_TIME_WINDOW_STATE.get("last_detail", "") or ""),
+        "last_run_at": float(ONE_TIME_WINDOW_STATE.get("last_run_at", 0) or 0),
     }
 
 
@@ -4380,104 +4380,142 @@ def smc_plan(candles: list[dict[str, float | int]], smc: dict[str, object], dail
     return empty
 
 
-def evaluate_server_smc_once(symbol: str = SERVER_SMC_SYMBOL) -> dict[str, object]:
-    resolved_symbol, candles = fetch_candles(symbol, "M15", 500)
-    smc_candles = candles[-SERVER_SMC_CONTEXT_BARS:]
-    if len(smc_candles) < 24:
-        return {"status": "waiting", "detail": "Waiting for enough rolling M15 candles."}
-    smc = smc_structure(smc_candles)
-    daily_insight = smc_new_day_insight(smc_candles, smc)
-    plan = smc_plan(smc_candles, smc, daily_insight)
-    effective_bias = str(daily_insight.get("bias")) if daily_insight.get("status") == "confirmed" else str(smc.get("majorBias", "range"))
-    latest_fvg = smc.get("fairValueGaps", [])[-1] if smc.get("fairValueGaps") else None
-    fib = smc.get("fib") if isinstance(smc.get("fib"), dict) else None
-    fib_status = f"{str(fib.get('status', '')).upper()} - {fib.get('statusReason', '')}" if fib else "--"
+def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -> dict[str, object]:
+    resolved_symbol, m15_candles = fetch_candles(symbol, "M15", 500)
+    _, m5_candles = fetch_candles(resolved_symbol, "M5", 1000)
+    now_ts = int(time.time())
+    range_candles = []
+    for candle in m15_candles:
+        candle_time = int(_num(candle.get("time")))
+        local_time = datetime.fromtimestamp(candle_time, ZoneInfo("America/New_York"))
+        if candle_time + 15 * 60 <= now_ts and local_time.hour == 8 and local_time.minute == 15:
+            range_candles.append(candle)
+    if not range_candles:
+        return {"status": "waiting", "detail": "Waiting for the closed 08:15 New York M15 window candle."}
+
+    range_candle = max(range_candles, key=lambda candle: int(_num(candle.get("time"))))
+    range_time = int(_num(range_candle.get("time")))
+    session_date = datetime.fromtimestamp(range_time, ZoneInfo("America/New_York")).date()
+    range_high = float(_num(range_candle.get("high")))
+    range_low = float(_num(range_candle.get("low")))
+    closed_m5 = []
+    for candle in m5_candles:
+        candle_time = int(_num(candle.get("time")))
+        local_time = datetime.fromtimestamp(candle_time, ZoneInfo("America/New_York"))
+        if candle_time + 5 * 60 <= now_ts and local_time.date() == session_date and candle_time >= range_time + 15 * 60:
+            closed_m5.append(candle)
+    closed_m5.sort(key=lambda candle: int(_num(candle.get("time"))))
+
+    breakout_index = None
+    side = None
+    for index, candle in enumerate(closed_m5):
+        close = float(_num(candle.get("close")))
+        if close > range_high:
+            breakout_index, side = index, "buy"
+            break
+        if close < range_low:
+            breakout_index, side = index, "sell"
+            break
+    if breakout_index is None or side is None:
+        return {"status": "hold", "detail": "Window is set; waiting for the first closed M5 breakout."}
+
+    breakout = closed_m5[breakout_index]
+    entry = float(_num(breakout.get("close")))
+    stop = None
+    for index in range(breakout_index - 2, 1, -1):
+        neighborhood = closed_m5[index - 2:index + 3]
+        if len(neighborhood) != 5 or any(float(_num(item.get("high"))) > range_high or float(_num(item.get("low"))) < range_low for item in neighborhood):
+            continue
+        pivot = closed_m5[index]
+        if side == "buy":
+            is_swing = (
+                float(_num(pivot.get("low"))) <= float(_num(closed_m5[index - 1].get("low")))
+                and float(_num(pivot.get("low"))) <= float(_num(closed_m5[index - 2].get("low")))
+                and float(_num(pivot.get("low"))) < float(_num(closed_m5[index + 1].get("low")))
+                and float(_num(pivot.get("low"))) < float(_num(closed_m5[index + 2].get("low")))
+            )
+            candidate = float(_num(pivot.get("low")))
+            valid_side = candidate < entry
+        else:
+            is_swing = (
+                float(_num(pivot.get("high"))) >= float(_num(closed_m5[index - 1].get("high")))
+                and float(_num(pivot.get("high"))) >= float(_num(closed_m5[index - 2].get("high")))
+                and float(_num(pivot.get("high"))) > float(_num(closed_m5[index + 1].get("high")))
+                and float(_num(pivot.get("high"))) > float(_num(closed_m5[index + 2].get("high")))
+            )
+            candidate = float(_num(pivot.get("high")))
+            valid_side = candidate > entry
+        if is_swing and valid_side:
+            stop = candidate
+            break
+
+    stop_source = "inside-range swing"
+    if stop is None:
+        stop_source = "opposite range boundary"
+        stop = range_low if side == "buy" else range_high
+    risk = abs(entry - stop)
+    if not math.isfinite(risk) or risk <= 0:
+        return {"status": "hold", "detail": "First breakout has no valid stop distance; no trade plan was produced."}
+    target = entry + risk * 1.5 if side == "buy" else entry - risk * 1.5
+    breakout_time = int(_num(breakout.get("time")))
+    signal_close_time = breakout_time + 5 * 60
+    if now_ts < signal_close_time or now_ts - signal_close_time > 90:
+        return {"status": "stale", "detail": "Breakout signal is outside the 90-second execution window."}
+    signal_id = f"one-time-window:{breakout_time}:{side}"
+    detail = f"One Time Window {side.upper()} after the first closed M5 breakout. Stop uses {stop_source}; target is 1.5R."
     append_ai_logic_audit(
         build_ai_logic_event(
-            "server_smc_verdict",
-            "ready" if plan.get("active") else "hold",
-            resolved_symbol,
-            detail=str(plan.get("trigger") or "Server SMC heartbeat: no executable setup."),
-            model=SERVER_SMC_MODEL,
-            strategy_version="june10-reconstructed",
-            verdict=plan.get("side") or "hold",
-            setup_type=str(plan.get("label") or "No Active Setup"),
-            major_bias=str(smc.get("majorBias", "")),
-            effective_bias=effective_bias,
-            minor_bias=str(smc.get("minorBias", "")),
-            market_phase=str(smc.get("state", "")),
-            daily_bias=str(daily_insight.get("bias", "range")),
-            daily_status=str(daily_insight.get("status", "")),
-            daily_summary=str(daily_insight.get("summary", "")),
-            fib_status=fib_status,
-            active_fvg=f"{str(latest_fvg.get('type')).upper()} {_fmt_price(latest_fvg.get('low'))}-{_fmt_price(latest_fvg.get('high'))}" if latest_fvg else "--",
-            signal_id=str(plan.get("signalId") or ""),
-            last_candle_time=int(_num(smc_candles[-1].get("time"))),
+            "one_time_window_signal", "ready", resolved_symbol, detail=detail,
+            model=ONE_TIME_WINDOW_MODEL, strategy_version="one-time-window-m15-m5",
+            verdict=side, setup_type="One Time Window", signal_id=signal_id,
+            last_candle_time=breakout_time, entry=entry, sl=stop, tp=target, rr=1.5, stop_source=stop_source,
         )
     )
-    if not plan.get("active") or not plan.get("side"):
-        return {"status": "hold", "detail": "No executable server SMC setup."}
     status_code, result = evaluate_autotrade_signal(
-        symbol=resolved_symbol,
-        side=str(plan["side"]),
-        lot=float(AUTOTRADE_STATE.get("lot", 0.01) or 0.01),
-        entry=plan.get("entry"),
-        sl=plan.get("sl"),
-        tp=plan.get("tp"),
-        signal_id=str(plan.get("signalId") or ""),
-        decision_key=str(plan.get("signalId") or ""),
-        action="server_smc_june10_reconstructed",
+        symbol=resolved_symbol, side=side, lot=float(AUTOTRADE_STATE.get("lot", 0.01) or 0.01),
+        entry=entry, sl=stop, tp=target, signal_id=signal_id, decision_key=signal_id,
+        action="server_one_time_window_m15_m5",
         ai_trade={
-            "decision": str(plan["side"]),
-            "setup_type": str(plan["label"]),
-            "trigger_state": "server_m15_live_state",
-            "trigger_summary": str(plan["trigger"]),
-            "execution_summary": str(plan["execution"]),
-            "major_bias": str(smc.get("majorBias", "")),
-            "effective_bias": effective_bias,
-            "minor_bias": str(smc.get("minorBias", "")),
-            "market_phase": str(smc.get("state", "")),
-            "daily_bias": str(daily_insight.get("bias", "range")),
-            "daily_status": str(daily_insight.get("status", "")),
-            "signal_key": str(plan.get("signalId") or ""),
-            "model": SERVER_SMC_MODEL,
-            "strategy_version": "june10-reconstructed",
+            "decision": side, "setup_type": "One Time Window",
+            "trigger_state": "closed_m5_range_breakout", "trigger_summary": detail,
+            "execution_summary": f"Entry {entry:.2f}; SL {stop:.2f} ({stop_source}); TP {target:.2f} (1.5R).",
+            "model": ONE_TIME_WINDOW_MODEL, "strategy_version": "one-time-window-m15-m5",
         },
     )
-    return {"status": result.get("status", status_code), "detail": result.get("detail", ""), "signal_id": plan.get("signalId", "")}
+    return {"status": result.get("status", status_code), "detail": result.get("detail", detail), "signal_id": signal_id}
 
 
-def server_smc_worker() -> None:
+def one_time_window_worker() -> None:
     while True:
         try:
-            maybe_run_server_smc()
+            maybe_run_one_time_window()
         except Exception as error:
             append_ai_logic_audit(
                 build_ai_logic_event(
-                    "server_smc_worker",
+                    "one_time_window_worker",
                     "error",
-                    SERVER_SMC_SYMBOL,
+                    ONE_TIME_WINDOW_SYMBOL,
                     detail=str(error),
-                    model=SERVER_SMC_MODEL,
-                    strategy_version="june10-reconstructed",
+                    model=ONE_TIME_WINDOW_MODEL,
+                    strategy_version="one-time-window-m15-m5",
                 )
             )
-        time.sleep(SERVER_SMC_INTERVAL_SECONDS)
+        time.sleep(ONE_TIME_WINDOW_INTERVAL_SECONDS)
 
 
-def maybe_run_server_smc() -> dict[str, object] | None:
+def maybe_run_one_time_window() -> dict[str, object] | None:
     now_ts = time.time()
-    if now_ts - float(SERVER_SMC_STATE.get("last_run_at", 0.0) or 0.0) < SERVER_SMC_INTERVAL_SECONDS:
+    if now_ts - float(ONE_TIME_WINDOW_STATE.get("last_run_at", 0.0) or 0.0) < ONE_TIME_WINDOW_INTERVAL_SECONDS:
         return None
     with AUTOTRADE_LOCK:
         enabled = bool(AUTOTRADE_STATE.get("enabled"))
         active = bool(AUTOTRADE_STATE.get("trade_active"))
     if not enabled or active or get_cooldown_remaining_seconds() > 0:
         return None
-    SERVER_SMC_STATE["last_run_at"] = now_ts
-    result = evaluate_server_smc_once()
-    SERVER_SMC_STATE["last_status"] = str(result.get("status", ""))
-    SERVER_SMC_STATE["last_detail"] = str(result.get("detail", ""))
+    ONE_TIME_WINDOW_STATE["last_run_at"] = now_ts
+    result = evaluate_server_one_time_window_once()
+    ONE_TIME_WINDOW_STATE["last_status"] = str(result.get("status", ""))
+    ONE_TIME_WINDOW_STATE["last_detail"] = str(result.get("detail", ""))
     return result
 
 
@@ -4586,6 +4624,10 @@ def place_market_order(
             digits = int(getattr(symbol_info, "digits", 2) or 2)
             volume = normalize_volume(symbol_info, lot)
             price = float(tick.ask if side == "buy" else tick.bid)
+            if sl is not None and tp is not None:
+                valid_plan = float(sl) < price < float(tp) if side == "buy" else float(tp) < price < float(sl)
+                if not valid_plan:
+                    return {"status": "rejected", "detail": "SL/TP levels no longer bracket the live MT5 entry price.", "symbol": resolved_symbol, "price": round(price, digits), "sl": sl, "tp": tp}
             order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
             if sl is None and sl_distance is not None and sl_distance > 0:
                 sl = price - sl_distance if side == "buy" else price + sl_distance
@@ -5303,7 +5345,7 @@ def autonomous_ai_worker() -> None:
                 if bar_time is not None and bar_time != last_m15_bar_time:
                     last_m15_bar_time = bar_time
                     run_autonomous_ai_cycle()
-            maybe_run_server_smc()
+            maybe_run_one_time_window()
         except Exception as error:
             append_ai_logic_audit(
                 build_ai_logic_event(
@@ -6019,6 +6061,15 @@ class AppHandler(SimpleHTTPRequestHandler):
         action = str(payload.get("action", "") or "").strip().lower()
         symbol = str(payload.get("symbol", "XAUUSD") or "XAUUSD").strip().upper().replace(".P", "").replace("GOLD", "XAUUSD")
         lot = float(AUTOTRADE_STATE.get("lot", 0.01) or 0.01)
+        try:
+            sl = None if payload.get("sl") in {None, "", "--"} else float(payload.get("sl"))
+            tp = None if payload.get("tp") in {None, "", "--"} else float(payload.get("tp"))
+        except (TypeError, ValueError):
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "SL and TP must be numeric when provided."})
+            return
+        if (sl is None) != (tp is None):
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Provide both SL and TP, or neither."})
+            return
 
         if not AUTOTRADE_STATE.get("enabled"):
             self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": "Autotrade is disabled."})
@@ -6055,7 +6106,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
 
             try:
-                result = place_market_order(symbol, action, lot, sl=None, tp=None, sl_distance=DBB_FIXED_STOP_DISTANCE)
+                result = place_market_order(symbol, action, lot, sl=sl, tp=tp, sl_distance=DBB_FIXED_STOP_DISTANCE if sl is None else None)
                 if result.get("status") == "placed":
                     result["copy_recipients"] = queue_copy_open(result)
             except Exception as error:
@@ -6141,8 +6192,8 @@ def main() -> None:
         print("WARNING: no admin account was bootstrapped. Set QUANTUM_INITIAL_ADMIN_EMAIL and QUANTUM_INITIAL_ADMIN_PASSWORD before first launch.")
     autonomous_thread = threading.Thread(target=autonomous_ai_worker, name="autonomous-ai-worker", daemon=True)
     autonomous_thread.start()
-    server_smc_thread = threading.Thread(target=server_smc_worker, name="server-smc-worker", daemon=True)
-    server_smc_thread.start()
+    one_time_window_thread = threading.Thread(target=one_time_window_worker, name="server-smc-worker", daemon=True)
+    one_time_window_thread.start()
     sheet_sync_thread = threading.Thread(target=google_sheet_sync_worker, name="google-sheet-sync-worker", daemon=True)
     sheet_sync_thread.start()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
@@ -6153,7 +6204,7 @@ def main() -> None:
         print(f"Autonomous AI loop active for {AUTONOMOUS_AI_SYMBOL} every {AUTONOMOUS_AI_INTERVAL_SECONDS // 60} minutes.")
     else:
         print("Autonomous AI loop disabled by default.")
-    print(f"Server SMC trade loop active for {SERVER_SMC_SYMBOL} every {SERVER_SMC_INTERVAL_SECONDS} seconds.")
+    print(f"One Time Window server engine active for {ONE_TIME_WINDOW_SYMBOL} every {ONE_TIME_WINDOW_INTERVAL_SECONDS} seconds.")
     print(f"Google Sheets sync worker active every {GOOGLE_SHEET_SYNC_INTERVAL_SECONDS} seconds.")
     print(google_sheet_sync_startup_status())
     print("Keep this terminal window open while using the site.")
