@@ -3245,6 +3245,11 @@ def place_market_order(symbol: str, side: str, lot: float, sl: float | None, tp:
             digits = int(getattr(symbol_info, "digits", 2) or 2)
             volume = normalize_volume(symbol_info, lot)
             price = float(tick.ask if side == "buy" else tick.bid)
+            if sl is not None and tp is not None:
+                valid_plan = float(sl) < price < float(tp) if side == "buy" else float(tp) < price < float(sl)
+                if not valid_plan:
+                    digits = int(getattr(symbol_info, "digits", 2) or 2)
+                    return {"status": "rejected", "detail": "SL/TP levels no longer bracket the live MT5 entry price.", "symbol": resolved_symbol, "price": round(price, digits), "sl": sl, "tp": tp}
             order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
@@ -4331,6 +4336,15 @@ class AppHandler(SimpleHTTPRequestHandler):
         action = str(payload.get("action", "") or "").strip().lower()
         symbol = str(payload.get("symbol", "XAUUSD") or "XAUUSD").strip().upper().replace(".P", "").replace("GOLD", "XAUUSD")
         lot = float(AUTOTRADE_STATE.get("lot", 0.01) or 0.01)
+        try:
+            sl = None if payload.get("sl") in {None, "", "--"} else float(payload.get("sl"))
+            tp = None if payload.get("tp") in {None, "", "--"} else float(payload.get("tp"))
+        except (TypeError, ValueError):
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "SL and TP must be numeric when provided."})
+            return
+        if (sl is None) != (tp is None):
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"detail": "Provide both SL and TP, or neither."})
+            return
 
         if not AUTOTRADE_STATE.get("enabled"):
             self.respond_json(HTTPStatus.OK, {"status": "skipped", "detail": "Autotrade is disabled."})
@@ -4363,7 +4377,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
 
             try:
-                result = place_market_order(symbol, action, lot, sl=None, tp=None)
+                result = place_market_order(symbol, action, lot, sl=sl, tp=tp)
             except Exception as error:
                 self.respond_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": str(error)})
                 return
