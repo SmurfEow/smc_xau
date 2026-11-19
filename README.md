@@ -1,68 +1,41 @@
 # Quantum
 
-Quantum is a local MT5 auto-trading workspace for `XAUUSD` powered by a Double Bollinger Band (DBB) Momentum strategy.
+Quantum is a local MT5 auto-trading workspace for `XAUUSD` with a dashboard-driven One Time Window breakout strategy.
 
 - Live MT5 candles and ticks
 - Neural Alpha React dashboard for monitoring and control
-- DBB signal plotting with next-candle entry/exit execution
+- One Time Window range, breakout, conditional stop, and 1.5R target plotting
 - Optional dashboard-driven auto-trade execution through MT5
 - Trade/audit logs and Google Sheets sync support
 
-The Python server is the MT5/API engine. The Neural Alpha dashboard is the live chart, control, and local DBB signal layer.
+The Python server is the MT5/API engine. The Neural Alpha dashboard is the live chart, control, and local One Time Window signal layer.
 
 ---
 
-## Current Strategy: Double Bollinger Band Momentum
+## Current Strategy: One Time Window
 
-### Parameters
+### Setup
 
 | Parameter | Value |
 |---|---|
-| Symbol | `XAUUSD` or broker equivalent such as `XAUUSD.m` |
-| Strategy timeframe | M15 |
-| BB length | 20 |
-| Inner band | `basis +/- 1 * stdev` |
-| Outer band | `basis +/- 2 * stdev` |
-| Band expansion threshold | 1.04 |
-| Minimum hold | 3 M15 bars |
-| Hard stop | 18 XAUUSD points |
-| Basis trend lookback | 8 M15 bars |
-| Minimum breakout distance | 8% of current 1SD band width beyond the trigger band |
-| Default lot size | 0.10 |
+| Range timeframe | M15 |
+| Range candle | 08:15–08:30 New York time |
+| Trigger timeframe | M5 |
+| Trigger | First closed M5 candle whose close is outside the range |
+| Reward | 1.5R |
+| Stop | Latest confirmed inside-range M5 swing; opposite range boundary if no usable swing exists |
 
-### Entry Logic
+### Entry and Stop Logic
 
-- Long signal: confirmed M15 close crosses above the 1SD upper band, bands are expanding, the DBB basis is rising over the last 8 bars, and the close clears the band by at least 8% of current 1SD width.
-- Short signal: confirmed M15 close crosses below the 1SD lower band, bands are expanding, the DBB basis is falling over the last 8 bars, and the close clears the band by at least 8% of current 1SD width.
-- The signal is detected on the closed candle.
-- The signal marker is plotted on the confirmed signal candle.
-- Auto-trade execution happens on the next candle open window.
-
-### Exit Logic
-
-- Long exit: confirmed M15 close crosses back under the 1SD upper band after the minimum hold.
-- Short exit: confirmed M15 close crosses back over the 1SD lower band after the minimum hold.
-- Exit markers are plotted on the confirmed exit signal candle.
-- Auto-close execution happens on the next candle open window.
-
-### Expansion Filter
-
-```text
-expanding = (u1 - l1) > (u1_prev - l1_prev) * 1.04
-```
-
-The current defensive profile uses `1.04` live. It blocks low-momentum chop and only allows entries when the inner DBB width is expanding with enough force.
-
-### Defensive Filters
-
-```text
-long_ok  = basis > basis[8] and close >= u1 + ((u1 - l1) * 0.08)
-short_ok = basis < basis[8] and close <= l1 - ((u1 - l1) * 0.08)
-```
-
-These filters were added after the demo audit showed weak long crosses causing the worst drawdowns.
+- The high and low of the closed 08:15 New York M15 candle define the daily window.
+- After 08:30, the first closed M5 candle that closes above the high triggers a buy; the first candle that closes below the low triggers a sell.
+- For a buy, the stop uses the latest confirmed M5 swing low formed inside the range. For a sell, it uses the latest confirmed swing high formed inside the range.
+- If there is no usable inside-range swing, the stop falls back to the opposite edge of the M15 range.
+- The target is 1.5 times the entry-to-stop distance. If there is no valid risk distance, no trade plan is produced.
+- New York time uses `America/New_York`, including daylight-saving changes.
 
 ---
+
 
 ## Live Chart Behavior
 
@@ -73,42 +46,31 @@ The dashboard separates cheap live updates from heavier sync work:
 - Recent MT5 candles sync every 2 seconds.
 - Heavier AI/board context refreshes less often to reduce chart lag.
 
-Chart markers:
-
-- `B` means DBB buy action.
-- `S` means DBB sell action.
-- `X` means DBB exit action.
-- Markers are plotted on the confirmed signal candle.
-- Auto-trade uses the following candle as the action candle.
-
-The chart marker is the source of truth for the dashboard trigger: a fresh `B`, `S`, or `X` on the just-closed candle can fire on the next candle.
+Chart overlays show the One Time Window high/low and, after a breakout, the entry, conditional stop, 1.5R target, and direction marker.
 
 ---
 
 ## Auto-Trade Timing
 
-The dashboard DBB auto-trade path is intentionally next-candle based:
+The dashboard and server worker use the One Time Window setup:
 
-1. M15 candle closes.
-2. The dashboard evaluates DBB markers on the confirmed candle that just closed.
-3. The next M15 candle appears.
-4. If the signal is from the just-closed candle, the dashboard sends `/api/dbb/webhook`.
-5. The backend sends the market order or close request to MT5 immediately.
+1. The 08:15 New York M15 candle closes at 08:30 and defines the daily range.
+2. The first closed M5 candle outside the range selects buy or sell.
+3. The stop uses the latest confirmed inside-range swing, with the opposite range edge as fallback; target is 1.5R.
+4. The dashboard sends the order plan to `/api/dbb/webhook`. The server worker evaluates the same setup independently.
+5. The server validates SL/TP against the live MT5 quote before submitting an order.
 
-Current guard:
+Execution guard:
 
-- Signals are computed from `m15Candles.slice(0, -1)` so the forming candle is not used.
-- Execution is allowed only during the first 20 seconds of the next M15 candle.
-- Duplicate signals are blocked by signal time and type.
+- Only closed candles are used.
+- The signal may execute only within 90 seconds of the breakout candle close.
+- The existing auto-trade switch, open-position lock, cooldown, session guard, and MT5 order handling remain active.
 
-Expected timing:
-
-- Usually within the 1-second tick polling cadence after the new candle appears.
-- Exact zero-delay execution is not possible because the browser polls tick data, posts the webhook, and MT5 then sends the order.
-
-Important: the local DBB chart/webhook auto-trade path requires the dashboard tab to be open. The backend also has an autonomous worker path, but it is disabled by default unless configured through environment settings.
+The dashboard tab can show and draw the setup; the backend worker uses the same rules when the server is running.
 
 ---
+
+
 
 ## Run
 
@@ -176,7 +138,7 @@ The compiled `neural_website_repo/dist/` folder is served by `server.py` when pr
 - `/api/ai/status` - current AI/autonomous status snapshot
 - `/api/autotrade/status` - autotrade state
 - `/api/autotrade/config` - enable/disable autotrade and lot size
-- `/api/dbb/webhook` - dashboard DBB buy/sell/close webhook
+- `/api/dbb/webhook` - dashboard One Time Window buy/sell/close webhook
 - `/api/history/dashboard` - closed-trade analytics
 
 ---
@@ -184,8 +146,8 @@ The compiled `neural_website_repo/dist/` folder is served by `server.py` when pr
 ## Files
 
 - `server.py` - local HTTP server, MT5 integration, API endpoints, order execution, logging
-- `neural_website_repo/src/components/TradingChart.tsx` - live chart, Trade Matrix, DBB plotting, dashboard webhook trigger
-- `dbb_momentum_baseline.txt` - Pine Script DBB reference
+- `neural_website_repo/src/components/TradingChart.tsx` - live chart, Trade Matrix, One Time Window plotting, dashboard webhook trigger
+- `dbb_momentum_baseline.txt` - Pine Script One Time Window reference
 - `dbb_backtest.py` - optional offline backtest helper
 - `google_sheet_sync.py` - Google Sheets sync helper
 - `ai_logic_audit.json` - audit trail
