@@ -4387,7 +4387,7 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
     range_candles = []
     for candle in m15_candles:
         candle_time = int(_num(candle.get("time")))
-        local_time = datetime.fromtimestamp(candle_time, ZoneInfo("America/New_York"))
+        local_time = datetime.fromtimestamp(candle_time - 5 * 60 * 60, timezone.utc)
         if candle_time + 15 * 60 <= now_ts and local_time.hour == 8 and local_time.minute == 15:
             range_candles.append(candle)
     if not range_candles:
@@ -4395,25 +4395,26 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
 
     range_candle = max(range_candles, key=lambda candle: int(_num(candle.get("time"))))
     range_time = int(_num(range_candle.get("time")))
-    session_date = datetime.fromtimestamp(range_time, ZoneInfo("America/New_York")).date()
+    session_date = datetime.fromtimestamp(range_time - 5 * 60 * 60, timezone.utc).date()
     range_high = float(_num(range_candle.get("high")))
     range_low = float(_num(range_candle.get("low")))
     closed_m5 = []
     for candle in m5_candles:
         candle_time = int(_num(candle.get("time")))
-        local_time = datetime.fromtimestamp(candle_time, ZoneInfo("America/New_York"))
-        if candle_time + 5 * 60 <= now_ts and local_time.date() == session_date and candle_time >= range_time + 15 * 60:
+        local_time = datetime.fromtimestamp(candle_time - 5 * 60 * 60, timezone.utc)
+        if candle_time + 5 * 60 <= now_ts and local_time.date() == session_date and local_time.hour < 17 and candle_time >= range_time + 15 * 60:
             closed_m5.append(candle)
     closed_m5.sort(key=lambda candle: int(_num(candle.get("time"))))
 
     breakout_index = None
     side = None
     for index, candle in enumerate(closed_m5):
-        close = float(_num(candle.get("close")))
-        if close > range_high:
+        candle_open = float(_num(candle.get("open")))
+        candle_close = float(_num(candle.get("close")))
+        if min(candle_open, candle_close) > range_high:
             breakout_index, side = index, "buy"
             break
-        if close < range_low:
+        if max(candle_open, candle_close) < range_low:
             breakout_index, side = index, "sell"
             break
     if breakout_index is None or side is None:
@@ -4462,7 +4463,7 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
     if now_ts < signal_close_time or now_ts - signal_close_time > 90:
         return {"status": "stale", "detail": "Breakout signal is outside the 90-second execution window."}
     signal_id = f"one-time-window:{breakout_time}:{side}"
-    detail = f"One Time Window {side.upper()} after the first closed M5 breakout. Stop uses {stop_source}; target is 1.5R."
+    detail = f"One Time Window {side.upper()} after the first fully closed M5 body breakout. Stop uses {stop_source}; target is 1.5R."
     append_ai_logic_audit(
         build_ai_logic_event(
             "one_time_window_signal", "ready", resolved_symbol, detail=detail,
@@ -4477,7 +4478,7 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
         action="server_one_time_window_m15_m5",
         ai_trade={
             "decision": side, "setup_type": "One Time Window",
-            "trigger_state": "closed_m5_range_breakout", "trigger_summary": detail,
+            "trigger_state": "m5_body_closed_outside_range", "trigger_summary": detail,
             "execution_summary": f"Entry {entry:.2f}; SL {stop:.2f} ({stop_source}); TP {target:.2f} (1.5R).",
             "model": ONE_TIME_WINDOW_MODEL, "strategy_version": "one-time-window-m15-m5",
         },
