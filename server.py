@@ -4389,25 +4389,30 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
     resolved_symbol, m15_candles = fetch_candles(symbol, "M15", 500)
     _, m5_candles = fetch_candles(resolved_symbol, "M5", 1000)
     now_ts = int(time.time())
+    execution_tick = fetch_tick(resolved_symbol)
+    raw_tick_time = int(_num(execution_tick.get("time")))
+    offset_seconds = raw_tick_time - now_ts
+    broker_offset_seconds = int(round(offset_seconds / 3600.0) * 3600) if abs(offset_seconds) <= 12 * 60 * 60 else 0
+    tick_time_utc = raw_tick_time - broker_offset_seconds
     range_candles = []
     for candle in m15_candles:
         candle_time = int(_num(candle.get("time")))
-        local_time = datetime.fromtimestamp(candle_time - 5 * 60 * 60, timezone.utc)
-        if candle_time + 15 * 60 <= now_ts and local_time.hour == 8 and local_time.minute == 15:
+        local_time = datetime.fromtimestamp(candle_time - broker_offset_seconds - 5 * 60 * 60, timezone.utc)
+        if candle_time + 15 * 60 <= raw_tick_time and local_time.hour == 8 and local_time.minute == 15:
             range_candles.append(candle)
     if not range_candles:
         return {"status": "waiting", "detail": "Waiting for the closed 08:15 UTC−5 M15 window candle."}
 
     range_candle = max(range_candles, key=lambda candle: int(_num(candle.get("time"))))
     range_time = int(_num(range_candle.get("time")))
-    session_date = datetime.fromtimestamp(range_time - 5 * 60 * 60, timezone.utc).date()
+    session_date = datetime.fromtimestamp(range_time - broker_offset_seconds - 5 * 60 * 60, timezone.utc).date()
     range_high = float(_num(range_candle.get("high")))
     range_low = float(_num(range_candle.get("low")))
     closed_m5 = []
     for candle in m5_candles:
         candle_time = int(_num(candle.get("time")))
-        local_time = datetime.fromtimestamp(candle_time - 5 * 60 * 60, timezone.utc)
-        if candle_time + 5 * 60 <= now_ts and local_time.date() == session_date and local_time.hour < 17 and candle_time >= range_time + 15 * 60:
+        local_time = datetime.fromtimestamp(candle_time - broker_offset_seconds - 5 * 60 * 60, timezone.utc)
+        if candle_time + 5 * 60 <= raw_tick_time and local_time.date() == session_date and local_time.hour < 17 and candle_time >= range_time + 15 * 60:
             closed_m5.append(candle)
     closed_m5.sort(key=lambda candle: int(_num(candle.get("time"))))
 
@@ -4426,16 +4431,14 @@ def evaluate_server_one_time_window_once(symbol: str = ONE_TIME_WINDOW_SYMBOL) -
         return {"status": "hold", "detail": "Window is set; waiting for the first M5 candle body to close fully outside the range."}
 
     breakout = closed_m5[breakout_index]
-    breakout_time = int(_num(breakout.get("time")))
+    breakout_time = int(_num(breakout.get("time"))) - broker_offset_seconds
     entry_bar_time = breakout_time + 5 * 60
-    tick = fetch_tick(resolved_symbol)
-    tick_time = int(_num(tick.get("time")))
-    if tick_time < entry_bar_time:
+    if tick_time_utc < entry_bar_time:
         return {"status": "waiting", "detail": "Breakout confirmed; waiting for the next M5 candle to start before entering."}
-    if tick_time >= entry_bar_time + 90:
+    if tick_time_utc >= entry_bar_time + 90:
         return {"status": "stale", "detail": "The next M5 candle's immediate-entry window has passed; this setup is skipped."}
 
-    entry = float(_num(tick.get("ask" if side == "buy" else "bid")))
+    entry = float(_num(execution_tick.get("ask" if side == "buy" else "bid")))
     structural_stops = []
     for index in range(breakout_index - 2, 1, -1):
         neighborhood = closed_m5[index - 2:index + 3]
